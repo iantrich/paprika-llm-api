@@ -27,22 +27,26 @@ operating all of the above yourself.
 
 ## Status
 
-**Early. One tool, deliberately.**
+**Groceries are complete. Recipes and meal planning are next.**
 
-`paprika_llm__get_grocery_lists` exists to prove the whole chain end to end:
-custom LLM API registration → exposure via `mcp_server` → remote reachability
-→ OAuth from the client. The remaining tools are ported once that holds.
+| Tool | Behaviour |
+|---|---|
+| `paprika_llm__get_grocery_lists` | read-only |
+| `paprika_llm__get_groceries` | read-only |
+| `paprika_llm__get_grocery` | read-only |
+| `paprika_llm__add_grocery` | write, additive, not idempotent |
+| `paprika_llm__clear_grocery_list` | write, **destructive** |
 
-## Not the same as `rbrunt/paprika-ha`
+Each tool declares Home Assistant `ToolAnnotations`. The defaults describe the
+least safe case, so reads opt in to `read_only` explicitly and
+`clear_grocery_list` is marked `destructive` for clients that surface it.
 
-This integration uses the domain `paprika_llm`, deliberately. The unofficial
-[Paprika Recipes](https://github.com/rbrunt/paprika-ha) integration uses
-`paprika`, and two integrations cannot share a domain — HACS installs both into
-`custom_components/<domain>/`, so a collision silently overwrites one with the
-other and Home Assistant then hands one integration's config entry to the
-other's code.
+Still to port: the six recipe tools (`list_recipes`, `read_recipe`,
+`search_recipes`, `filter_recipes_by_ingredient`, `filter_recipes_by_time`,
+`create_recipe`, `update_recipe`) and the three meal-plan tools
+(`list_meal_plan`, `add_meal_to_plan`, `remove_meal_from_plan`).
 
-The two do different things and can be installed side by side.
+`delete_recipe` is deliberately omitted and will stay omitted.
 
 ## Requirements
 
