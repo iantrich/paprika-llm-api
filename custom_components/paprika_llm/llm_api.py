@@ -72,10 +72,14 @@ class PaprikaTool(llm.Tool):
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> JsonObjectType:
-        """Run the tool, translating Paprika failures into tool errors."""
+    ) -> llm.ToolResult:
+        """Run the tool, translating Paprika failures into tool errors.
+
+        Returns a ToolResult rather than a bare dict: Home Assistant accepts a
+        JSON object today but deprecates it, and it stops working in 2027.11.
+        """
         try:
-            return await self._run(tool_input.tool_args)
+            return llm.ToolResult(data=await self._run(tool_input.tool_args))
         except PaprikaAPIError as err:
             # Raised as a tool error rather than left to escape as a transport
             # failure, so the model can explain itself to the user.
