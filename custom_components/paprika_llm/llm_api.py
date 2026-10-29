@@ -117,6 +117,26 @@ class GetGroceryListsTool(PaprikaTool):
         }
 
 
+class GetGroceryAislesTool(PaprikaTool):
+    """List the grocery aisles defined on the account."""
+
+    name = f"{TOOL_PREFIX}get_grocery_aisles"
+    title = "Get Paprika grocery aisles"
+    description = (
+        "List the grocery aisles defined in Paprika, in store order. Aisle "
+        "names are chosen by the user and may be numbers matching a store's "
+        "layout (for example '1' to '6') rather than categories, so read them "
+        "before choosing an aisle for add_grocery."
+    )
+    parameters = probatio.Schema({})
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return the account's aisles."""
+        aisles = await self._client.get_grocery_aisles()
+        return {"aisles": [a["name"] for a in aisles]}
+
+
 class GetGroceriesTool(PaprikaTool):
     """Read every item on a grocery list."""
 
@@ -139,7 +159,11 @@ class GetGroceriesTool(PaprikaTool):
             "grocery_list": list_name or "default",
             "count": len(items),
             "items": [
-                {"name": item.get("name", ""), "quantity": item.get("quantity", "")}
+                {
+                    "name": item.get("name", ""),
+                    "quantity": item.get("quantity", ""),
+                    "aisle": item.get("aisle", ""),
+                }
                 for item in items
             ],
         }
@@ -196,7 +220,11 @@ class AddGroceryTool(PaprikaTool):
     title = "Add a Paprika grocery item"
     description = (
         "Add an item to a Paprika grocery list. If the item is already on the "
-        "list, the quantity is added to what is there rather than replacing it."
+        "list, the quantity is added to what is there rather than replacing it. "
+        "Optionally place it in a specific aisle; aisle names are the user's "
+        "own (see get_grocery_aisles). Without an aisle, an existing item keeps "
+        "its aisle and a new item goes where Paprika remembers that ingredient "
+        "belongs, falling back to Miscellaneous."
     )
     parameters = probatio.Schema(
         {
@@ -206,6 +234,9 @@ class AddGroceryTool(PaprikaTool):
             # Verified against probatio 0.13.0 for int, float and str.
             probatio.Optional("quantity", default="1"): probatio.Coerce(str),
             probatio.Optional("grocery_list_name"): str,
+            # Coerced for the same reason as quantity: numbered aisles invite
+            # a model to send {"aisle": 5}.
+            probatio.Optional("aisle"): probatio.Coerce(str),
         }
     )
     # Not idempotent: calling twice adds the quantity twice.
@@ -217,6 +248,7 @@ class AddGroceryTool(PaprikaTool):
             item_name=args["item_name"],
             quantity=args.get("quantity", "1"),
             grocery_list_name=args.get("grocery_list_name"),
+            aisle=args.get("aisle"),
         )
         return {
             "added": True,
@@ -287,6 +319,7 @@ def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
     """
     return [
         GetGroceryListsTool(client),
+        GetGroceryAislesTool(client),
         GetGroceriesTool(client),
         GetGroceryTool(client),
         AddGroceryTool(client),

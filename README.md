@@ -32,14 +32,30 @@ operating all of the above yourself.
 | Tool | Behaviour |
 |---|---|
 | `paprika_llm__get_grocery_lists` | read-only |
+| `paprika_llm__get_grocery_aisles` | read-only |
 | `paprika_llm__get_groceries` | read-only |
 | `paprika_llm__get_grocery` | read-only |
-| `paprika_llm__add_grocery` | write, additive, not idempotent |
+| `paprika_llm__add_grocery` | write, additive, not idempotent; optional `aisle` |
 | `paprika_llm__clear_grocery_list` | write, **destructive** |
 
 Each tool declares Home Assistant `ToolAnnotations`. The defaults describe the
 least safe case, so reads opt in to `read_only` explicitly and
 `clear_grocery_list` is marked `destructive` for clients that surface it.
+
+### Aisles
+
+`add_grocery` takes an optional `aisle`, matched case-insensitively against
+the account's own aisle names (which may be numbers like `1`–`6` rather than
+categories — `get_grocery_aisles` lists them). `"aisle 5"` matches an aisle
+named `5`. An unknown aisle is an error that lists the real ones; aisles are
+never created implicitly.
+
+Without an aisle:
+
+1. an item already on the list **keeps its current aisle**;
+2. a new item goes where Paprika remembers that ingredient belongs
+   (`/sync/groceryingredients/` — the same memory the Paprika apps sort by);
+3. otherwise it goes to `Miscellaneous`.
 
 Still to port: the six recipe tools (`list_recipes`, `read_recipe`,
 `search_recipes`, `filter_recipes_by_ingredient`, `filter_recipes_by_time`,

@@ -1757,6 +1757,17 @@ class PaprikaClient:
             response = await self._make_authenticated_request("GET", "/sync/groceries")
             groceries = response.get("result", [])
 
+            # Resolve aisle names from aisle_uid. The row's own "aisle" text can
+            # be stale: Paprika re-files an unknown aisle_uid under
+            # Miscellaneous without updating the text.
+            try:
+                names_by_uid = {
+                    a["uid"]: a["name"] for a in await self.get_grocery_aisles()
+                }
+            except Exception as e:  # aisle names are nice-to-have, not essential
+                logger.warning(f"Could not load grocery aisles: {str(e)}")
+                names_by_uid = {}
+
             filtered_groceries = []
             for grocery in groceries:
                 if grocery.get("list_uid") == list_uuid:
@@ -1764,6 +1775,9 @@ class PaprikaClient:
                         {
                             "name": grocery.get("name", ""),
                             "quantity": grocery.get("quantity", ""),
+                            "aisle": names_by_uid.get(
+                                grocery.get("aisle_uid"), grocery.get("aisle", "")
+                            ),
                         }
                     )
 
@@ -1796,11 +1810,113 @@ class PaprikaClient:
             logger.error(f"Failed to get grocery item '{item_name}': {str(e)}")
             raise PaprikaAPIError(f"Failed to get grocery item: {str(e)}")
 
+    async def get_grocery_aisles(self) -> List[Dict[str, Any]]:
+        """Return the account's grocery aisles, in the order Paprika sorts them.
+
+        Aisles are user-defined (an account might have "Produce", "Dairy" or
+        simply "1" through "6" to match a store's layout), so their names must
+        be read rather than assumed.
+        """
+        response = await self._make_authenticated_request("GET", "/sync/groceryaisles/")
+        aisles = response.get("result", []) or []
+        return sorted(
+            (
+                {
+                    "name": a.get("name", ""),
+                    "uid": a.get("uid", ""),
+                    "order_flag": a.get("order_flag", 0),
+                }
+                for a in aisles
+            ),
+            key=lambda a: a["order_flag"],
+        )
+
+    @staticmethod
+    def _match_aisle(
+        requested: str, aisles: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Find an aisle by name, case-insensitively.
+
+        A leading "aisle " is also tolerated, because accounts with numbered
+        aisles get asked for "aisle 5" when the aisle is actually named "5".
+        """
+        wanted = requested.strip().casefold()
+        candidates = [wanted]
+        if wanted.startswith("aisle "):
+            candidates.append(wanted[len("aisle "):].strip())
+        for candidate in candidates:
+            for aisle in aisles:
+                if aisle["name"].strip().casefold() == candidate:
+                    return aisle
+        return None
+
+    async def _resolve_aisle(
+        self,
+        item_name: str,
+        requested_aisle: Optional[str],
+        existing_grocery: Optional[Dict[str, Any]],
+    ) -> Tuple[str, str, str]:
+        """Decide which aisle an added item belongs in.
+
+        Returns (aisle_name, aisle_uid, source), where source is one of
+        "requested", "existing", "remembered" or "default", so callers can
+        say why an item landed where it did.
+
+        Order of precedence:
+          1. An explicitly requested aisle. Unknown names raise rather than
+             creating an aisle the user did not ask for.
+          2. The aisle an existing item is already in. Re-adding an item must
+             not move it.
+          3. The aisle Paprika remembers for that ingredient
+             (/sync/groceryingredients/), which is how the Paprika apps
+             auto-sort.
+          4. The account's "Miscellaneous" aisle, if it has one.
+        """
+        if requested_aisle and requested_aisle.strip():
+            aisles = await self.get_grocery_aisles()
+            match = self._match_aisle(requested_aisle, aisles)
+            if match is None:
+                names = ", ".join(repr(a["name"]) for a in aisles) or "none"
+                raise PaprikaAPIError(
+                    f"No grocery aisle named {requested_aisle!r}. "
+                    f"Available aisles: {names}"
+                )
+            return match["name"], match["uid"], "requested"
+
+        if existing_grocery and existing_grocery.get("aisle_uid"):
+            return (
+                existing_grocery.get("aisle", "") or "",
+                existing_grocery["aisle_uid"],
+                "existing",
+            )
+
+        aisles = await self.get_grocery_aisles()
+        names_by_uid = {a["uid"]: a["name"] for a in aisles}
+
+        response = await self._make_authenticated_request(
+            "GET", "/sync/groceryingredients/"
+        )
+        wanted = item_name.strip().casefold()
+        for ingredient in response.get("result", []) or []:
+            uid = ingredient.get("aisle_uid")
+            if (
+                uid
+                and uid in names_by_uid
+                and str(ingredient.get("name", "")).strip().casefold() == wanted
+            ):
+                return names_by_uid[uid], uid, "remembered"
+
+        fallback = self._match_aisle("Miscellaneous", aisles)
+        if fallback is not None:
+            return fallback["name"], fallback["uid"], "default"
+        return "", "", "default"
+
     async def add_grocery(
         self,
         item_name: str,
         quantity: Union[int, str] = 1,
         grocery_list_name: Optional[str] = None,
+        aisle: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not item_name or not item_name.strip():
             raise PaprikaAPIError("Item name cannot be empty")
@@ -1833,6 +1949,10 @@ class PaprikaClient:
                 current_quantity_str, quantity_str
             )
 
+            aisle_name, aisle_uid, aisle_source = await self._resolve_aisle(
+                item_name, aisle, existing_grocery
+            )
+
             grocery_data = [
                 {
                     "uid": grocery_uid,
@@ -1842,11 +1962,15 @@ class PaprikaClient:
                     "recipe_uid": None,
                     "order_flag": 316,
                     "purchased": False,
-                    "aisle": "Produce",
+                    # Previously hardcoded to "Produce" with a fixed aisle_uid
+                    # that need not exist on the account (Paprika files unknown
+                    # aisles under Miscellaneous but keeps the stale name), and
+                    # re-adding an item moved it there too.
+                    "aisle": aisle_name,
                     "recipe": None,
                     "instruction": "",
                     "separate": False,
-                    "aisle_uid": "F94467760BF4BC6B9521FFA9329D0F1DBCCA0F5AC0808BD8552FB375A565FB9E",
+                    "aisle_uid": aisle_uid,
                     "list_uid": list_uuid,
                 }
             ]
@@ -1868,6 +1992,8 @@ class PaprikaClient:
             return {
                 "name": item_name.strip(),
                 "quantity": final_quantity_str,
+                "aisle": aisle_name,
+                "aisle_source": aisle_source,
             }
 
         except PaprikaAPIError:
