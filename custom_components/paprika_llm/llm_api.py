@@ -48,6 +48,10 @@ API_PROMPT = (
     "everything in one add_groceries call rather than one add_grocery per item.\n"
     "Meals of kind 'note' are free text with no recipe; ask whether the note "
     "itself is something to buy.\n"
+    "When the user says they already have something, offer to add it to the "
+    "pantry with add_pantry_items so future lists skip it.\n"
+    "Removals match exact names; read the list or pantry first and use the "
+    "names as shown.\n"
     "Grocery aisle names are the user's own (see get_grocery_aisles)."
 )
 
@@ -70,6 +74,11 @@ WRITE_DESTRUCTIVE = llm.ToolAnnotations(
 )
 REMOVE_ONE = llm.ToolAnnotations(
     read_only=False, destructive=True, idempotent=False, open_world=True
+)
+# Saving a pantry item twice leaves the same state: quantities are replaced,
+# not added, so unlike add_groceries this is idempotent.
+WRITE_UPSERT = llm.ToolAnnotations(
+    read_only=False, destructive=False, idempotent=True, open_world=True
 )
 
 
@@ -365,6 +374,135 @@ class ClearGroceryListTool(PaprikaTool):
         }
 
 
+class RemoveGroceriesTool(PaprikaTool):
+    """Remove specific items from a grocery list."""
+
+    name = f"{TOOL_PREFIX}remove_groceries"
+    title = "Remove Paprika grocery items"
+    description = (
+        "Remove specific items from a Paprika grocery list, matched by exact "
+        "name (case-insensitive) as shown by get_groceries. Names that match "
+        "nothing are reported back rather than guessed at. To empty the whole "
+        "list, use clear_grocery_list instead."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required(
+                "names", description="Item names exactly as they appear on the list."
+            ): [str],
+            probatio.Optional("grocery_list_name", description=LIST_NAME): str,
+        }
+    )
+    annotations = WRITE_DESTRUCTIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Remove the items and report what was and wasn't found."""
+        result = await self._client.remove_groceries(
+            names=args["names"], grocery_list_name=args.get("grocery_list_name")
+        )
+        return {"grocery_list": args.get("grocery_list_name") or "default", **result}
+
+
+# ------------------------------------------------------------------- pantry
+
+
+class GetPantryTool(PaprikaTool):
+    """Read the pantry."""
+
+    name = f"{TOOL_PREFIX}get_pantry"
+    title = "Get Paprika pantry"
+    description = (
+        "List what is in the user's Paprika pantry. By default only items "
+        "marked in stock, which are the ones a shopping list can skip."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Optional(
+                "in_stock_only",
+                default=True,
+                description="Only items marked in stock. False includes ones marked as run out.",
+            ): bool,
+        }
+    )
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return pantry items."""
+        items = await self._client.get_pantry(
+            in_stock_only=args.get("in_stock_only", True)
+        )
+        return {"count": len(items), "items": items}
+
+
+class AddPantryItemsTool(PaprikaTool):
+    """Add or update pantry items."""
+
+    name = f"{TOOL_PREFIX}add_pantry_items"
+    title = "Add Paprika pantry items"
+    description = (
+        "Add items to the Paprika pantry, or update ones already there, in a "
+        "single write. Use it when the user says they already have something, "
+        "so future shopping lists skip it. An item already in the pantry is "
+        "updated rather than duplicated. Set in_stock to false to mark an item "
+        "as run out without removing it."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("items", description="Pantry items to save."): [
+                {
+                    probatio.Required("name", description="Ingredient, e.g. 'yellow mustard'."): str,
+                    probatio.Optional(
+                        "quantity",
+                        description=(
+                            "How much is on hand, e.g. '2 jars'. Replaces the "
+                            "stored amount; omit to leave it unchanged."
+                        ),
+                    ): probatio.Coerce(str),
+                    probatio.Optional(
+                        "aisle",
+                        description="Aisle name from get_grocery_aisles. Omit to keep or infer it.",
+                    ): probatio.Coerce(str),
+                    probatio.Optional(
+                        "in_stock",
+                        default=True,
+                        description="Whether the item is on hand. False marks it as run out.",
+                    ): bool,
+                }
+            ],
+        }
+    )
+    annotations = WRITE_UPSERT
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Save the items and report each one."""
+        return await self._client.add_pantry_items(items=args["items"])
+
+
+class RemovePantryItemsTool(PaprikaTool):
+    """Remove pantry items."""
+
+    name = f"{TOOL_PREFIX}remove_pantry_items"
+    title = "Remove Paprika pantry items"
+    description = (
+        "Remove items from the Paprika pantry entirely, matched by exact name "
+        "(case-insensitive) as shown by get_pantry. Names that match nothing "
+        "are reported back rather than guessed at. To record that something "
+        "has simply run out, prefer add_pantry_items with in_stock false."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required(
+                "names", description="Pantry item names exactly as get_pantry shows them."
+            ): [str],
+        }
+    )
+    annotations = WRITE_DESTRUCTIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Remove the items and report what was and wasn't found."""
+        return await self._client.remove_pantry_items(names=args["names"])
+
+
 # ------------------------------------------------------------------ recipes
 
 
@@ -641,7 +779,12 @@ def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
             GetGroceryTool,
             AddGroceryTool,
             AddGroceriesTool,
+            RemoveGroceriesTool,
             ClearGroceryListTool,
+            # pantry
+            GetPantryTool,
+            AddPantryItemsTool,
+            RemovePantryItemsTool,
             # recipes
             SearchRecipesTool,
             # meal plan

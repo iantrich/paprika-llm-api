@@ -25,7 +25,8 @@ from custom_components.paprika_llm.paprika_client import (  # noqa: E402
 
 EXPECTED = {
     "get_grocery_lists", "get_grocery_aisles", "get_groceries", "get_grocery",
-    "add_grocery", "add_groceries", "clear_grocery_list", "search_recipes",
+    "add_grocery", "add_groceries", "remove_groceries", "clear_grocery_list",
+    "get_pantry", "add_pantry_items", "remove_pantry_items", "search_recipes",
     "list_meal_plan", "get_meal_plan_ingredients", "add_meal_to_plan",
     "remove_meal_from_plan",
 }
@@ -79,6 +80,11 @@ def test_annotations_reach_the_client(client):
     for n in ("get_groceries", "get_meal_plan_ingredients", "search_recipes", "list_meal_plan"):
         assert hints[n].readOnlyHint is True and hints[n].destructiveHint is False
     assert hints["clear_grocery_list"].destructiveHint is True
+    assert hints["remove_groceries"].destructiveHint is True
+    assert hints["remove_pantry_items"].destructiveHint is True
+    assert hints["get_pantry"].readOnlyHint is True
+    assert hints["add_pantry_items"].destructiveHint is False
+    assert hints["add_pantry_items"].idempotentHint is True
     assert hints["remove_meal_from_plan"].destructiveHint is True
     assert hints["add_groceries"].idempotentHint is False
 

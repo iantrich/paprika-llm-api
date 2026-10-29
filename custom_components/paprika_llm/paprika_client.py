@@ -2068,6 +2068,59 @@ class PaprikaClient:
             "aisle_source": added["aisle_source"],
         }
 
+    async def remove_groceries(
+        self, names: List[str], grocery_list_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Remove items from a grocery list by exact name (case-insensitive).
+
+        One write for any number of items. Names that match nothing on the
+        list are reported rather than guessed at, so a near-miss never removes
+        the wrong item. Uses the same soft delete as clear_grocery_list.
+        """
+        wanted: List[str] = []
+        for raw in names:
+            name = str(raw or "").strip()
+            if name and name.casefold() not in {w.casefold() for w in wanted}:
+                wanted.append(name)
+        if not wanted:
+            return {"removed": [], "not_found": [], "count": 0}
+
+        try:
+            list_uuid = await self._get_list_uuid_by_name(grocery_list_name)
+            response = await self._make_authenticated_request("GET", "/sync/groceries")
+            on_list: Dict[str, Dict[str, Any]] = {}
+            for grocery in response.get("result", []) or []:
+                if grocery.get("list_uid") != list_uuid or grocery.get("deleted"):
+                    continue
+                on_list.setdefault(str(grocery.get("name", "")).strip().casefold(), grocery)
+
+            rows, removed, not_found = [], [], []
+            for name in wanted:
+                row = on_list.get(name.casefold())
+                if row is None:
+                    not_found.append(name)
+                    continue
+                rows.append({**row, "deleted": True})
+                removed.append(row.get("name"))
+
+            if rows:
+                data = aiohttp.FormData()
+                data.add_field(
+                    "data",
+                    BytesIO(self._gzip_json(rows)),
+                    filename="grocery.json.gz",
+                    content_type="application/octet-stream",
+                )
+                await self._make_authenticated_request("POST", "/sync/groceries", data=data)
+            logger.info(f"Removed {len(rows)} grocery item(s) in one write")
+            return {"removed": removed, "not_found": not_found, "count": len(removed)}
+
+        except PaprikaAPIError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to remove groceries: {str(e)}")
+            raise PaprikaAPIError(f"Failed to remove groceries: {str(e)}")
+
     async def get_pantry(self, in_stock_only: bool = True) -> List[Dict[str, Any]]:
         """Return pantry items, by default only those marked in stock."""
         response = await self._make_authenticated_request("GET", "/sync/pantry/")
@@ -2085,6 +2138,160 @@ class PaprikaClient:
                 }
             )
         return [i for i in items if i["name"]]
+
+    async def _post_pantry_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """Write pantry rows in one request (same sync format as groceries)."""
+        data = aiohttp.FormData()
+        data.add_field(
+            "data",
+            BytesIO(self._gzip_json(rows)),
+            filename="pantry.json.gz",
+            content_type="application/octet-stream",
+        )
+        await self._make_authenticated_request("POST", "/sync/pantry/", data=data)
+
+    async def _live_pantry_rows(self) -> Dict[str, Dict[str, Any]]:
+        """Non-deleted pantry rows keyed by casefolded ingredient name."""
+        response = await self._make_authenticated_request("GET", "/sync/pantry/")
+        rows: Dict[str, Dict[str, Any]] = {}
+        for row in response.get("result", []) or []:
+            name = str(row.get("ingredient") or "").strip()
+            if name and not row.get("deleted"):
+                rows.setdefault(name.casefold(), row)
+        return rows
+
+    async def add_pantry_items(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Add items to the pantry, or update them if already there, in one write.
+
+        Each item is a dict with "name", and optionally "quantity", "aisle"
+        and "in_stock" (default True). An item already in the pantry keeps its
+        row: it is marked in or out of stock as asked, its quantity is
+        replaced only if one is given (a pantry quantity is what is on hand,
+        not an amount to add), and it keeps its aisle unless one is given.
+        Passing in_stock=False is how an item is marked as run out.
+
+        Aisles follow the grocery rules, and every requested aisle is checked
+        before anything is written.
+        """
+        merged: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for raw in items:
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                raise PaprikaAPIError("Pantry item name cannot be empty")
+            key = name.casefold()
+            if key not in merged:
+                order.append(key)
+            # A later mention of the same item wins.
+            merged[key] = {
+                "name": name,
+                "quantity": raw.get("quantity"),
+                "aisle": raw.get("aisle"),
+                "in_stock": raw.get("in_stock", True) is not False,
+            }
+
+        if not merged:
+            return {"saved": [], "count": 0}
+
+        try:
+            existing = await self._live_pantry_rows()
+            aisles = await self.get_grocery_aisles()
+            needs_memory = any(
+                not merged[k]["aisle"] and k not in existing for k in order
+            )
+            remembered = await self._get_remembered_aisle_uids() if needs_memory else None
+            today = datetime.now().strftime("%Y-%m-%d 00:00:00")
+
+            rows: List[Dict[str, Any]] = []
+            results: List[Dict[str, Any]] = []
+            for key in order:
+                item = merged[key]
+                current = existing.get(key)
+                aisle_name, aisle_uid, aisle_source = self._pick_aisle(
+                    item["name"], item["aisle"], current, aisles, remembered
+                )
+                if current:
+                    row = dict(current)
+                    if item["quantity"] is not None:
+                        row["quantity"] = str(item["quantity"])
+                    if item["in_stock"] and not current.get("in_stock"):
+                        row["purchase_date"] = today
+                else:
+                    row = {
+                        "uid": self._generate_uuid(),
+                        "ingredient": item["name"],
+                        "expiration_date": None,
+                        "has_expiration": False,
+                        "purchase_date": today,
+                        "quantity": str(item["quantity"] or ""),
+                        "location_uid": None,
+                        "notes": None,
+                    }
+                row.update(
+                    {
+                        "aisle": aisle_name,
+                        "aisle_uid": aisle_uid,
+                        "in_stock": item["in_stock"],
+                        "deleted": False,
+                    }
+                )
+                rows.append(row)
+                results.append(
+                    {
+                        "name": row["ingredient"],
+                        "was_in_pantry": current is not None,
+                        "in_stock": item["in_stock"],
+                        "quantity": row.get("quantity") or "",
+                        "aisle": aisle_name,
+                        "aisle_source": aisle_source,
+                    }
+                )
+
+            await self._post_pantry_rows(rows)
+            logger.info(f"Saved {len(rows)} pantry item(s) in one write")
+            return {"saved": results, "count": len(results)}
+
+        except PaprikaAPIError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to save pantry items: {str(e)}")
+            raise PaprikaAPIError(f"Failed to save pantry items: {str(e)}")
+
+    async def remove_pantry_items(self, names: List[str]) -> Dict[str, Any]:
+        """Remove pantry items by exact name (case-insensitive), in one write.
+
+        Names that match nothing are reported rather than guessed at, so a
+        near-miss never deletes the wrong item.
+        """
+        wanted: List[str] = []
+        for raw in names:
+            name = str(raw or "").strip()
+            if name and name.casefold() not in {w.casefold() for w in wanted}:
+                wanted.append(name)
+        if not wanted:
+            return {"removed": [], "not_found": [], "count": 0}
+
+        try:
+            existing = await self._live_pantry_rows()
+            rows, removed, not_found = [], [], []
+            for name in wanted:
+                row = existing.get(name.casefold())
+                if row is None:
+                    not_found.append(name)
+                    continue
+                rows.append({**row, "deleted": True})
+                removed.append(row.get("ingredient"))
+
+            if rows:
+                await self._post_pantry_rows(rows)
+            logger.info(f"Removed {len(rows)} pantry item(s) in one write")
+            return {"removed": removed, "not_found": not_found, "count": len(removed)}
+
+        except PaprikaAPIError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to remove pantry items: {str(e)}")
+            raise PaprikaAPIError(f"Failed to remove pantry items: {str(e)}")
 
     async def get_meal_plan_ingredients(
         self,

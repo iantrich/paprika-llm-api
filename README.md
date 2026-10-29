@@ -38,6 +38,11 @@ they need on the grocery list, minus what's already in the pantry.**
    skipped — before writing anything.
 4. `add_groceries` writes the whole list in one request.
 
+When you say you already have something, it can go into the pantry with
+`add_pantry_items` so later lists skip it. Removals — from the list or the
+pantry — match exact names only, and anything that doesn't match is reported
+back rather than guessed at.
+
 Ingredient lines are free text (`2 tablespoons soy sauce` against a pantry
 entry `soy sauce`), so merging and pantry matching are left to the model's
 judgment rather than a string-matching parser. The tools do data access.
@@ -55,7 +60,11 @@ judgment rather than a string-matching parser. The tools do data access.
 | `paprika_llm__get_grocery` | read-only |
 | `paprika_llm__add_grocery` | write, additive; optional `aisle` |
 | `paprika_llm__add_groceries` | write, additive; many items in one request |
+| `paprika_llm__remove_groceries` | write, **destructive**; exact names, near-misses reported |
 | `paprika_llm__clear_grocery_list` | write, **destructive** |
+| `paprika_llm__get_pantry` | read-only; in-stock items by default |
+| `paprika_llm__add_pantry_items` | write; adds or updates, can mark items as run out |
+| `paprika_llm__remove_pantry_items` | write, **destructive**; exact names, near-misses reported |
 
 Meals planned as free-text notes (no recipe attached) are returned as kind
 `note` with no ingredients, not dropped.
