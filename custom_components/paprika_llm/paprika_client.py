@@ -1439,6 +1439,9 @@ class PaprikaClient:
                                 "meal_ID": recipe_uid or "",
                                 "date": date_str_for_result,
                                 "type": entry_type_str or "dinner",
+                                # A meal can be planned at a multiple of the
+                                # recipe; ingredient quantities scale with it.
+                                "scale": entry.get("scale"),
                             })
                 except ValueError:
                     continue
@@ -1850,17 +1853,18 @@ class PaprikaClient:
                     return aisle
         return None
 
-    async def _resolve_aisle(
+    def _pick_aisle(
         self,
         item_name: str,
         requested_aisle: Optional[str],
         existing_grocery: Optional[Dict[str, Any]],
+        aisles: List[Dict[str, Any]],
+        remembered_aisle_uids: Optional[Dict[str, str]],
     ) -> Tuple[str, str, str]:
-        """Decide which aisle an added item belongs in.
+        """Decide which aisle an added item belongs in. No I/O.
 
         Returns (aisle_name, aisle_uid, source), where source is one of
-        "requested", "existing", "remembered" or "default", so callers can
-        say why an item landed where it did.
+        "requested", "existing", "remembered" or "default".
 
         Order of precedence:
           1. An explicitly requested aisle. Unknown names raise rather than
@@ -1873,7 +1877,6 @@ class PaprikaClient:
           4. The account's "Miscellaneous" aisle, if it has one.
         """
         if requested_aisle and requested_aisle.strip():
-            aisles = await self.get_grocery_aisles()
             match = self._match_aisle(requested_aisle, aisles)
             if match is None:
                 names = ", ".join(repr(a["name"]) for a in aisles) or "none"
@@ -1890,26 +1893,160 @@ class PaprikaClient:
                 "existing",
             )
 
-        aisles = await self.get_grocery_aisles()
         names_by_uid = {a["uid"]: a["name"] for a in aisles}
-
-        response = await self._make_authenticated_request(
-            "GET", "/sync/groceryingredients/"
-        )
-        wanted = item_name.strip().casefold()
-        for ingredient in response.get("result", []) or []:
-            uid = ingredient.get("aisle_uid")
-            if (
-                uid
-                and uid in names_by_uid
-                and str(ingredient.get("name", "")).strip().casefold() == wanted
-            ):
-                return names_by_uid[uid], uid, "remembered"
+        uid = (remembered_aisle_uids or {}).get(item_name.strip().casefold())
+        if uid and uid in names_by_uid:
+            return names_by_uid[uid], uid, "remembered"
 
         fallback = self._match_aisle("Miscellaneous", aisles)
         if fallback is not None:
             return fallback["name"], fallback["uid"], "default"
         return "", "", "default"
+
+    async def _get_remembered_aisle_uids(self) -> Dict[str, str]:
+        """Map ingredient name (casefolded) to the aisle Paprika files it in."""
+        response = await self._make_authenticated_request(
+            "GET", "/sync/groceryingredients/"
+        )
+        remembered: Dict[str, str] = {}
+        for ingredient in response.get("result", []) or []:
+            uid = ingredient.get("aisle_uid")
+            name = str(ingredient.get("name", "")).strip().casefold()
+            if uid and name:
+                remembered.setdefault(name, uid)
+        return remembered
+
+    async def add_groceries(
+        self,
+        items: List[Dict[str, Any]],
+        grocery_list_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add several items to a grocery list in a single write.
+
+        Each item is a dict with "item_name", and optionally "quantity"
+        (default "1") and "aisle". Items already on the list have the quantity
+        added to what is there.
+
+        Adding items one at a time costs several requests each, and a new item
+        without an aisle also downloads the account's whole ingredient-aisle
+        memory. A week of meals is dozens of ingredients, which is how an
+        account gets rate-limited. This reads each source once and posts every
+        row together.
+
+        Every requested aisle is validated before anything is written, so a
+        bad aisle name fails the whole batch rather than half of it.
+        """
+        # Merge duplicates within the batch, so one item never produces two
+        # rows -- matching on a casefolded name, as Paprika's lists do.
+        merged: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for raw in items:
+            name = str(raw.get("item_name") or "").strip()
+            if not name:
+                raise PaprikaAPIError("Item name cannot be empty")
+            key = name.casefold()
+            quantity = str(raw.get("quantity", "1") or "1")
+            aisle = raw.get("aisle")
+            if key in merged:
+                merged[key]["quantity"], _ = self._add_quantities(
+                    merged[key]["quantity"], quantity
+                )
+                if aisle and not merged[key]["aisle"]:
+                    merged[key]["aisle"] = aisle
+            else:
+                merged[key] = {"item_name": name, "quantity": quantity, "aisle": aisle}
+                order.append(key)
+
+        if not merged:
+            return {"added": [], "count": 0}
+
+        try:
+            list_uuid = await self._get_list_uuid_by_name(grocery_list_name)
+            response = await self._make_authenticated_request("GET", "/sync/groceries")
+            existing_by_name: Dict[str, Dict[str, Any]] = {}
+            for grocery in response.get("result", []) or []:
+                if grocery.get("list_uid") != list_uuid or grocery.get("deleted"):
+                    continue
+                existing_by_name.setdefault(
+                    str(grocery.get("name", "")).strip().casefold(), grocery
+                )
+
+            aisles = await self.get_grocery_aisles()
+
+            # The ingredient-aisle memory is large; fetch it only if some item
+            # actually needs it -- new to the list and with no aisle given.
+            needs_memory = any(
+                not merged[k]["aisle"] and k not in existing_by_name for k in order
+            )
+            remembered = await self._get_remembered_aisle_uids() if needs_memory else None
+
+            rows: List[Dict[str, Any]] = []
+            results: List[Dict[str, Any]] = []
+            for key in order:
+                item = merged[key]
+                existing = existing_by_name.get(key)
+                aisle_name, aisle_uid, aisle_source = self._pick_aisle(
+                    item["item_name"], item["aisle"], existing, aisles, remembered
+                )
+
+                if existing:
+                    uid = existing.get("uid")
+                    current = str(existing.get("quantity", "0") or "0")
+                    name = str(existing.get("name", "")).strip() or item["item_name"]
+                else:
+                    uid = self._generate_uuid()
+                    current = "0"
+                    name = item["item_name"]
+
+                final_quantity, _ = self._add_quantities(current, item["quantity"])
+
+                rows.append(
+                    {
+                        "uid": uid,
+                        "name": name,
+                        "ingredient": name,
+                        "quantity": final_quantity,
+                        "recipe_uid": None,
+                        "order_flag": 316,
+                        "purchased": False,
+                        "aisle": aisle_name,
+                        "recipe": None,
+                        "instruction": "",
+                        "separate": False,
+                        "aisle_uid": aisle_uid,
+                        "list_uid": list_uuid,
+                        "deleted": False,
+                    }
+                )
+                results.append(
+                    {
+                        "name": name,
+                        "quantity": final_quantity,
+                        "added_quantity": item["quantity"],
+                        "was_on_list": existing is not None,
+                        "aisle": aisle_name,
+                        "aisle_source": aisle_source,
+                    }
+                )
+
+            gzipped_data = self._gzip_json(rows)
+            data = aiohttp.FormData()
+            data.add_field(
+                "data",
+                BytesIO(gzipped_data),
+                filename="grocery.json.gz",
+                content_type="application/octet-stream",
+            )
+            await self._make_authenticated_request("POST", "/sync/groceries", data=data)
+
+            logger.info(f"Added {len(rows)} grocery item(s) in one write")
+            return {"added": results, "count": len(results)}
+
+        except PaprikaAPIError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to add groceries: {str(e)}")
+            raise PaprikaAPIError(f"Failed to add groceries: {str(e)}")
 
     async def add_grocery(
         self,
@@ -1918,89 +2055,107 @@ class PaprikaClient:
         grocery_list_name: Optional[str] = None,
         aisle: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not item_name or not item_name.strip():
-            raise PaprikaAPIError("Item name cannot be empty")
+        """Add one item. A batch of one, so both paths share the same rules."""
+        result = await self.add_groceries(
+            [{"item_name": item_name, "quantity": str(quantity), "aisle": aisle}],
+            grocery_list_name=grocery_list_name,
+        )
+        added = result["added"][0]
+        return {
+            "name": added["name"],
+            "quantity": added["quantity"],
+            "aisle": added["aisle"],
+            "aisle_source": added["aisle_source"],
+        }
 
-        try:
-            quantity_str = str(quantity)
-
-            list_uuid = await self._get_list_uuid_by_name(grocery_list_name)
-            response = await self._make_authenticated_request("GET", "/sync/groceries")
-            groceries = response.get("result", [])
-
-            existing_grocery = None
-            for grocery in groceries:
-                grocery_name = grocery.get("name", "").strip()
-                if (
-                    grocery_name == item_name.strip()
-                    and grocery.get("list_uid") == list_uuid
-                ):
-                    existing_grocery = grocery
-                    break
-
-            if existing_grocery:
-                grocery_uid = existing_grocery.get("uid")
-                current_quantity_str = str(existing_grocery.get("quantity", "0"))
-            else:
-                grocery_uid = self._generate_uuid()
-                current_quantity_str = "0"
-
-            final_quantity_str, _ = self._add_quantities(
-                current_quantity_str, quantity_str
-            )
-
-            aisle_name, aisle_uid, aisle_source = await self._resolve_aisle(
-                item_name, aisle, existing_grocery
-            )
-
-            grocery_data = [
+    async def get_pantry(self, in_stock_only: bool = True) -> List[Dict[str, Any]]:
+        """Return pantry items, by default only those marked in stock."""
+        response = await self._make_authenticated_request("GET", "/sync/pantry/")
+        items = []
+        for row in response.get("result", []) or []:
+            if row.get("deleted"):
+                continue
+            if in_stock_only and not row.get("in_stock"):
+                continue
+            items.append(
                 {
-                    "uid": grocery_uid,
-                    "name": item_name.strip(),
-                    "ingredient": item_name.strip(),
-                    "quantity": final_quantity_str,
-                    "recipe_uid": None,
-                    "order_flag": 316,
-                    "purchased": False,
-                    # Previously hardcoded to "Produce" with a fixed aisle_uid
-                    # that need not exist on the account (Paprika files unknown
-                    # aisles under Miscellaneous but keeps the stale name), and
-                    # re-adding an item moved it there too.
-                    "aisle": aisle_name,
-                    "recipe": None,
-                    "instruction": "",
-                    "separate": False,
-                    "aisle_uid": aisle_uid,
-                    "list_uid": list_uuid,
+                    "name": str(row.get("ingredient") or "").strip(),
+                    "quantity": row.get("quantity") or "",
+                    "in_stock": bool(row.get("in_stock")),
                 }
-            ]
-
-            gzipped_data = self._gzip_json(grocery_data)
-            data = aiohttp.FormData()
-            data.add_field(
-                "data",
-                BytesIO(gzipped_data),
-                filename="grocery.json.gz",
-                content_type="application/octet-stream",
             )
+        return [i for i in items if i["name"]]
 
-            await self._make_authenticated_request("POST", "/sync/groceries", data=data)
+    async def get_meal_plan_ingredients(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        num_days: Optional[int] = None,
+        meal_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Collect what is needed to build a shopping list for planned meals.
 
-            logger.info(
-                f"Successfully added {quantity_str} '{item_name}' (total: {final_quantity_str})"
-            )
-            return {
-                "name": item_name.strip(),
-                "quantity": final_quantity_str,
-                "aisle": aisle_name,
-                "aisle_source": aisle_source,
+        Returns every planned meal in the window with its recipe's ingredient
+        lines, plus the in-stock pantry. Merging duplicate ingredients across
+        meals and deciding what the pantry already covers is left to the
+        caller: ingredient lines are free text ("2 tablespoons soy sauce"
+        against a pantry "soy sauce"), which needs judgment rather than string
+        matching.
+
+        Meals without a linked recipe are plain notes in Paprika. They are
+        returned with no ingredients and flagged, not dropped.
+        """
+        meals = await self.get_meal_plan(
+            num_days=num_days,
+            meal_type=meal_type,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        recipe_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        out_meals: List[Dict[str, Any]] = []
+        for meal in meals:
+            entry: Dict[str, Any] = {
+                "date": meal.get("date"),
+                "meal_type": meal.get("type"),
+                "name": str(meal.get("meal", "")).strip(),
+                "scale": meal.get("scale"),
             }
+            uid = meal.get("meal_ID")
+            if not uid:
+                entry.update({"kind": "note", "ingredients": []})
+                out_meals.append(entry)
+                continue
 
-        except PaprikaAPIError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to add grocery '{item_name}': {str(e)}")
-            raise PaprikaAPIError(f"Failed to add grocery: {str(e)}")
+            if uid not in recipe_cache:
+                recipe_cache[uid] = await self.get_recipe_by_uid(uid)
+            recipe = recipe_cache[uid]
+            if not recipe:
+                entry.update({"kind": "missing_recipe", "recipe_uid": uid, "ingredients": []})
+                out_meals.append(entry)
+                continue
+
+            lines = [
+                line.strip()
+                for line in str(recipe.get("ingredients") or "").splitlines()
+                if line.strip()
+            ]
+            entry.update(
+                {
+                    "kind": "recipe",
+                    "recipe_uid": uid,
+                    "recipe_name": recipe.get("name"),
+                    "servings": recipe.get("servings"),
+                    "ingredients": lines,
+                }
+            )
+            out_meals.append(entry)
+
+        pantry = await self.get_pantry(in_stock_only=True)
+        return {
+            "meals": out_meals,
+            "pantry_in_stock": [p["name"] for p in pantry],
+        }
 
     async def clear_grocery_list(self, grocery_list_name: Optional[str] = None) -> bool:
         try:

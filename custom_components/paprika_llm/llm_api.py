@@ -8,6 +8,9 @@ is no server, transport, tunnel or OAuth code of our own.
 
 Non-Assist APIs on those per-API endpoints require an admin Home Assistant
 user, enforced in mcp_server regardless of its `require_admin` option.
+
+Parameter schemas are converted for MCP clients by `probatio.to_openapi`, so
+the `description=` on each field is what the model reads.
 """
 
 from __future__ import annotations
@@ -20,25 +23,38 @@ import probatio
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
+from homeassistant.util import dt as dt_util
 from homeassistant.util.json import JsonObjectType
 
 from .const import DOMAIN, TOOL_PREFIX
-from .paprika_client import PaprikaAPIError, PaprikaClient
+from .paprika_client import (
+    MealMatchAmbiguousError,
+    MealNotFoundError,
+    PaprikaAPIError,
+    PaprikaClient,
+    ValidationError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 API_PROMPT = (
-    "Use these tools to read and manage the user's Paprika recipe collection, "
-    "grocery lists and meal plan. Grocery list names are matched "
-    "case-insensitively; omit the list name to use the default list."
+    "Use these tools to plan meals and manage the user's Paprika grocery list.\n"
+    "Weekly planning: choose recipes with search_recipes, schedule them with "
+    "add_meal_to_plan, then call get_meal_plan_ingredients for the week. Merge "
+    "the ingredient lines into what actually needs buying -- combine the same "
+    "ingredient across meals, apply each meal's scale, and drop anything the "
+    "in-stock pantry already covers. Before adding, show the user the list and "
+    "what you are skipping as pantry, and get their confirmation. Then add "
+    "everything in one add_groceries call rather than one add_grocery per item.\n"
+    "Meals of kind 'note' are free text with no recipe; ask whether the note "
+    "itself is something to buy.\n"
+    "Grocery aisle names are the user's own (see get_grocery_aisles)."
 )
 
-# Every grocery tool accepts an optional list name. Paprika accounts usually
-# have one list, so omitting it and letting the client resolve the default is
-# the common path.
-LIST_NAME_DESCRIPTION = (
-    "Name of the grocery list. Omit to use the account's default list."
-)
+# Field descriptions shared by several tools.
+LIST_NAME = "Name of the grocery list. Omit to use the default list."
+MEAL_TYPES = ["breakfast", "lunch", "dinner"]
+DATE_HELP = "Date as YYYY-MM-DD. Natural forms like 'Nov 3' are accepted."
 
 # Annotation presets. The ToolAnnotations defaults describe the least safe
 # case -- a destructive write reaching outside Home Assistant -- so anything
@@ -51,6 +67,9 @@ WRITE_ADDITIVE = llm.ToolAnnotations(
 )
 WRITE_DESTRUCTIVE = llm.ToolAnnotations(
     read_only=False, destructive=True, idempotent=True, open_world=True
+)
+REMOVE_ONE = llm.ToolAnnotations(
+    read_only=False, destructive=True, idempotent=False, open_world=True
 )
 
 
@@ -73,21 +92,35 @@ class PaprikaTool(llm.Tool):
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
     ) -> llm.ToolResult:
-        """Run the tool, translating Paprika failures into tool errors.
+        """Run the tool, translating client failures into tool errors.
 
         Returns a ToolResult rather than a bare dict: Home Assistant accepts a
         JSON object today but deprecates it, and it stops working in 2027.11.
+
+        Every client exception is caught here. MealNotFoundError and friends
+        are not PaprikaAPIError subclasses, and anything that escapes becomes
+        a transport failure the model cannot explain to the user.
         """
         try:
             return llm.ToolResult(data=await self._run(tool_input.tool_args))
+        except MealMatchAmbiguousError as err:
+            names = ", ".join(
+                repr(m.get("name")) for m in getattr(err, "matches", []) or []
+            )
+            raise HomeAssistantError(
+                f"{err}. Candidates: {names or 'none'}. Ask the user which one."
+            ) from err
+        except (MealNotFoundError, ValidationError) as err:
+            raise HomeAssistantError(str(err)) from err
         except PaprikaAPIError as err:
-            # Raised as a tool error rather than left to escape as a transport
-            # failure, so the model can explain itself to the user.
             raise HomeAssistantError(f"Paprika request failed: {err}") from err
 
     async def _run(self, args: dict[str, Any]) -> JsonObjectType:
         """Perform the tool's work. Implemented by each tool."""
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------- groceries
 
 
 class GetGroceryListsTool(PaprikaTool):
@@ -126,7 +159,7 @@ class GetGroceryAislesTool(PaprikaTool):
         "List the grocery aisles defined in Paprika, in store order. Aisle "
         "names are chosen by the user and may be numbers matching a store's "
         "layout (for example '1' to '6') rather than categories, so read them "
-        "before choosing an aisle for add_grocery."
+        "before choosing an aisle when adding groceries."
     )
     parameters = probatio.Schema({})
     annotations = READ_ONLY
@@ -143,11 +176,11 @@ class GetGroceriesTool(PaprikaTool):
     name = f"{TOOL_PREFIX}get_groceries"
     title = "Get Paprika grocery items"
     description = (
-        "Read all items currently on a Paprika grocery list, with quantities. "
-        "This is the tool to use for 'what's on my grocery list?'."
+        "Read all items currently on a Paprika grocery list, with quantities "
+        "and aisles. This is the tool to use for 'what's on my grocery list?'."
     )
     parameters = probatio.Schema(
-        {probatio.Optional("grocery_list_name"): str}
+        {probatio.Optional("grocery_list_name", description=LIST_NAME): str}
     )
     annotations = READ_ONLY
 
@@ -180,8 +213,8 @@ class GetGroceryTool(PaprikaTool):
     )
     parameters = probatio.Schema(
         {
-            probatio.Required("item_name"): str,
-            probatio.Optional("grocery_list_name"): str,
+            probatio.Required("item_name", description="Item to look up."): str,
+            probatio.Optional("grocery_list_name", description=LIST_NAME): str,
         }
     )
     annotations = READ_ONLY
@@ -213,30 +246,41 @@ class GetGroceryTool(PaprikaTool):
         }
 
 
+# Coerce rather than str for quantity and aisle: a model asked to "add 2
+# milks" emits a JSON number, and numbered aisles invite {"aisle": 5}. A bare
+# str rejects both before the tool runs. Verified against probatio 0.13.0,
+# the version Home Assistant pins.
+_ITEM_FIELDS = {
+    probatio.Required("item_name", description="Grocery item, e.g. 'eggs'."): str,
+    probatio.Optional(
+        "quantity",
+        default="1",
+        description="Amount to add, as a number or with a unit, e.g. '2' or '1 lb'.",
+    ): probatio.Coerce(str),
+    probatio.Optional(
+        "aisle",
+        description=(
+            "Aisle name from get_grocery_aisles. Omit to keep an existing "
+            "item's aisle or use the aisle Paprika remembers for it."
+        ),
+    ): probatio.Coerce(str),
+}
+
+
 class AddGroceryTool(PaprikaTool):
-    """Add an item to a grocery list."""
+    """Add one item to a grocery list."""
 
     name = f"{TOOL_PREFIX}add_grocery"
     title = "Add a Paprika grocery item"
     description = (
-        "Add an item to a Paprika grocery list. If the item is already on the "
-        "list, the quantity is added to what is there rather than replacing it. "
-        "Optionally place it in a specific aisle; aisle names are the user's "
-        "own (see get_grocery_aisles). Without an aisle, an existing item keeps "
-        "its aisle and a new item goes where Paprika remembers that ingredient "
-        "belongs, falling back to Miscellaneous."
+        "Add a single item to a Paprika grocery list. If the item is already on "
+        "the list, the quantity is added to what is there. For more than one "
+        "item, use add_groceries instead."
     )
     parameters = probatio.Schema(
         {
-            probatio.Required("item_name"): str,
-            # Coerce rather than str: an LLM asked to "add 2 milks" emits a
-            # JSON number, which a bare str rejects before the tool runs.
-            # Verified against probatio 0.13.0 for int, float and str.
-            probatio.Optional("quantity", default="1"): probatio.Coerce(str),
-            probatio.Optional("grocery_list_name"): str,
-            # Coerced for the same reason as quantity: numbered aisles invite
-            # a model to send {"aisle": 5}.
-            probatio.Optional("aisle"): probatio.Coerce(str),
+            **_ITEM_FIELDS,
+            probatio.Optional("grocery_list_name", description=LIST_NAME): str,
         }
     )
     # Not idempotent: calling twice adds the quantity twice.
@@ -257,6 +301,37 @@ class AddGroceryTool(PaprikaTool):
         }
 
 
+class AddGroceriesTool(PaprikaTool):
+    """Add many items to a grocery list in one write."""
+
+    name = f"{TOOL_PREFIX}add_groceries"
+    title = "Add Paprika grocery items"
+    description = (
+        "Add several items to a Paprika grocery list in a single write -- use "
+        "this for a whole shopping list. Items already on the list have the "
+        "quantity added to what is there; repeated items in the request are "
+        "merged. An unknown aisle name fails the whole request without "
+        "writing anything."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("items", description="Items to add."): [_ITEM_FIELDS],
+            probatio.Optional("grocery_list_name", description=LIST_NAME): str,
+        }
+    )
+    annotations = WRITE_ADDITIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Add all items and report where each one landed."""
+        result = await self._client.add_groceries(
+            items=args["items"], grocery_list_name=args.get("grocery_list_name")
+        )
+        return {
+            "grocery_list": args.get("grocery_list_name") or "default",
+            **result,
+        }
+
+
 class ClearGroceryListTool(PaprikaTool):
     """Remove every item from a grocery list."""
 
@@ -267,7 +342,7 @@ class ClearGroceryListTool(PaprikaTool):
         "from here, so confirm with the user before calling it."
     )
     parameters = probatio.Schema(
-        {probatio.Optional("grocery_list_name"): str}
+        {probatio.Optional("grocery_list_name", description=LIST_NAME): str}
     )
     annotations = WRITE_DESTRUCTIVE
 
@@ -290,6 +365,244 @@ class ClearGroceryListTool(PaprikaTool):
         }
 
 
+# ------------------------------------------------------------------ recipes
+
+
+class SearchRecipesTool(PaprikaTool):
+    """Find recipes to plan with."""
+
+    name = f"{TOOL_PREFIX}search_recipes"
+    title = "Search Paprika recipes"
+    description = (
+        "Search the user's Paprika recipes, or list them all when no query is "
+        "given. Each result includes when it was last planned, which helps "
+        "vary the week's meals. Ingredient text is not returned; use "
+        "get_meal_plan_ingredients once meals are planned."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Optional(
+                "query",
+                description="Text to look for, e.g. 'chicken'. Omit to list every recipe.",
+            ): str,
+            probatio.Optional(
+                "search_fields",
+                default="all",
+                description="Where to look for the query.",
+            ): probatio.In(["name", "ingredients", "description", "all"]),
+            probatio.Optional(
+                "limit", default=50, description="Maximum results."
+            ): probatio.Coerce(int),
+        }
+    )
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return matching recipes, compactly."""
+        # list_recipes is served from the hash-keyed recipe cache, so repeated
+        # searches during a planning session cost one index request each.
+        recipes = await self._client.list_recipes(limit=1000)
+
+        query = (args.get("query") or "").strip().casefold()
+        fields = args.get("search_fields", "all")
+        searched = (
+            ["name", "ingredients", "description"] if fields == "all" else [fields]
+        )
+
+        def matches(recipe: dict[str, Any]) -> bool:
+            if not query:
+                return True
+            return any(
+                query in str(recipe.get(field) or "").casefold() for field in searched
+            )
+
+        found = sorted(
+            (r for r in recipes if matches(r)),
+            key=lambda r: str(r.get("name", "")).casefold(),
+        )
+        limit = max(1, int(args.get("limit", 50)))
+        return {
+            "query": args.get("query"),
+            "total_matches": len(found),
+            "recipes": [
+                {
+                    "name": r.get("name"),
+                    "uid": r.get("uid"),
+                    "total_time": r.get("total_time") or None,
+                    "servings": r.get("servings") or None,
+                    "rating": r.get("rating") or None,
+                    "last_planned": r.get("last_planned"),
+                }
+                for r in found[:limit]
+            ],
+        }
+
+
+# --------------------------------------------------------------- meal plan
+
+_WINDOW_FIELDS = {
+    probatio.Optional("start_date", description=f"First day. {DATE_HELP}"): str,
+    probatio.Optional("end_date", description=f"Last day. {DATE_HELP}"): str,
+    probatio.Optional(
+        "num_days",
+        description="Days from today, when no dates are given. Defaults to 10.",
+    ): probatio.Coerce(int),
+    probatio.Optional(
+        "meal_type", description="Only this meal. Omit for all meals."
+    ): probatio.In(MEAL_TYPES),
+}
+
+
+class ListMealPlanTool(PaprikaTool):
+    """Read the meal plan."""
+
+    name = f"{TOOL_PREFIX}list_meal_plan"
+    title = "List Paprika meal plan"
+    description = (
+        "List planned meals in a date window. Meals of kind 'note' are free "
+        "text with no recipe attached."
+    )
+    parameters = probatio.Schema(_WINDOW_FIELDS)
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return the planned meals."""
+        meals = await self._client.get_meal_plan(
+            num_days=args.get("num_days"),
+            meal_type=args.get("meal_type"),
+            start_date=args.get("start_date"),
+            end_date=args.get("end_date"),
+        )
+        return {
+            "meals": [
+                {
+                    "date": m.get("date"),
+                    "meal_type": m.get("type"),
+                    "name": str(m.get("meal", "")).strip(),
+                    "kind": "recipe" if m.get("meal_ID") else "note",
+                    "recipe_uid": m.get("meal_ID") or None,
+                    "scale": m.get("scale"),
+                }
+                for m in meals
+            ]
+        }
+
+
+class GetMealPlanIngredientsTool(PaprikaTool):
+    """Gather what's needed to build a shopping list for planned meals."""
+
+    name = f"{TOOL_PREFIX}get_meal_plan_ingredients"
+    title = "Get ingredients for planned meals"
+    description = (
+        "For every meal planned in a date window, return its recipe's "
+        "ingredient lines, plus everything the user has in stock in their "
+        "Paprika pantry. Use this to build the week's shopping list: merge "
+        "ingredients across meals, apply each meal's scale, drop what the "
+        "pantry covers, confirm with the user, then call add_groceries once."
+    )
+    parameters = probatio.Schema(_WINDOW_FIELDS)
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return planned meals with ingredients, and the in-stock pantry."""
+        return await self._client.get_meal_plan_ingredients(
+            start_date=args.get("start_date"),
+            end_date=args.get("end_date"),
+            num_days=args.get("num_days"),
+            meal_type=args.get("meal_type"),
+        )
+
+
+class AddMealToPlanTool(PaprikaTool):
+    """Schedule a recipe."""
+
+    name = f"{TOOL_PREFIX}add_meal_to_plan"
+    title = "Add a meal to the Paprika plan"
+    description = (
+        "Schedule a recipe on a date. Identify the recipe by uid (from "
+        "search_recipes) or by name; an ambiguous name is refused with the "
+        "candidates rather than guessed. Without a date, the next day with no "
+        "meal of that type is used."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Optional("recipe_uid", description="Recipe uid from search_recipes."): str,
+            probatio.Optional("recipe_name", description="Recipe name, if no uid."): str,
+            probatio.Optional("date", description=DATE_HELP): str,
+            probatio.Optional(
+                "meal_type", default="dinner", description="Which meal."
+            ): probatio.In(MEAL_TYPES),
+        }
+    )
+    annotations = WRITE_ADDITIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Add the meal and report what was scheduled."""
+        if not args.get("recipe_uid") and not args.get("recipe_name"):
+            raise ValidationError("Provide recipe_uid or recipe_name.")
+        result = await self._client.add_meal_to_plan(
+            meal=args.get("recipe_name"),
+            meal_id=args.get("recipe_uid"),
+            date=args.get("date"),
+            meal_type=args.get("meal_type", "dinner"),
+        )
+        return {
+            "scheduled": True,
+            "date": result.get("date"),
+            "meal_type": result.get("type"),
+            "recipe_name": result.get("meal"),
+            "recipe_uid": result.get("meal_ID"),
+        }
+
+
+class RemoveMealFromPlanTool(PaprikaTool):
+    """Unschedule one meal."""
+
+    name = f"{TOOL_PREFIX}remove_meal_from_plan"
+    title = "Remove a meal from the Paprika plan"
+    description = (
+        "Remove one planned meal. Identify it by date, by recipe, or both; "
+        "giving both is the safest. This removes the meal from the plan, not "
+        "the recipe."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Optional("date", description=DATE_HELP): str,
+            probatio.Optional("recipe_uid", description="Recipe uid of the meal."): str,
+            probatio.Optional("recipe_name", description="Name of the meal."): str,
+            probatio.Optional(
+                "meal_type", default="dinner", description="Which meal."
+            ): probatio.In(MEAL_TYPES),
+        }
+    )
+    annotations = REMOVE_ONE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Remove the meal and report which one went."""
+        # The client treats no identifier at all as "the latest planned meal".
+        # That is too loose for a model to trigger by omission, so it is
+        # refused here.
+        if not (args.get("date") or args.get("recipe_uid") or args.get("recipe_name")):
+            raise ValidationError(
+                "Say which meal to remove: give a date, a recipe, or both."
+            )
+        result = await self._client.remove_meal_from_plan(
+            meal=args.get("recipe_name"),
+            meal_id=args.get("recipe_uid"),
+            date=args.get("date"),
+            meal_type=args.get("meal_type", "dinner"),
+        )
+        return {
+            "removed": True,
+            "date": result.get("date"),
+            "meal_type": result.get("type"),
+            "name": result.get("meal"),
+        }
+
+
+# --------------------------------------------------------------------- API
+
+
 @dataclass(slots=True, kw_only=True)
 class PaprikaLLMAPI(llm.API):
     """The Paprika API, as offered to LLM clients.
@@ -304,26 +617,39 @@ class PaprikaLLMAPI(llm.API):
         self, llm_context: llm.LLMContext
     ) -> llm.APIInstance:
         """Build the tool set for one request."""
+        # Built per request, so the date is always current. A model planning
+        # "this week" has no other reliable source for today's date.
+        today = dt_util.now()
+        prompt = f"Today is {today:%A, %Y-%m-%d}.\n{API_PROMPT}"
         return llm.APIInstance(
             api=self,
-            api_prompt=API_PROMPT,
+            api_prompt=prompt,
             llm_context=llm_context,
             tools=_build_tools(self.client),
         )
 
 
 def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
-    """Return every Paprika tool, bound to the given client.
-
-    Groceries are complete. Recipes and meal planning are ported next.
-    """
+    """Return every Paprika tool, bound to the given client."""
     return [
-        GetGroceryListsTool(client),
-        GetGroceryAislesTool(client),
-        GetGroceriesTool(client),
-        GetGroceryTool(client),
-        AddGroceryTool(client),
-        ClearGroceryListTool(client),
+        tool(client)
+        for tool in (
+            # groceries
+            GetGroceryListsTool,
+            GetGroceryAislesTool,
+            GetGroceriesTool,
+            GetGroceryTool,
+            AddGroceryTool,
+            AddGroceriesTool,
+            ClearGroceryListTool,
+            # recipes
+            SearchRecipesTool,
+            # meal plan
+            ListMealPlanTool,
+            GetMealPlanIngredientsTool,
+            AddMealToPlanTool,
+            RemoveMealFromPlanTool,
+        )
     ]
 
 
