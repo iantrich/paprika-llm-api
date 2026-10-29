@@ -1,0 +1,6 @@
+{
+  "name": "Paprika Recipe Manager",
+  "content_in_root": false,
+  "render_readme": true,
+  "homeassistant": "2026.10.0"
+}

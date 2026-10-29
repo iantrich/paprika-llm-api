@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Paprika account",
+        "description": "Sign in with your Paprika Recipe Manager account. Credentials are stored by Home Assistant and are never written to disk by this integration.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Paprika rejected those credentials.",
+      "cannot_connect": "Could not reach Paprika. Check connectivity and try again."
+    },
+    "abort": {
+      "already_configured": "That Paprika account is already set up."
+    }
+  }
+}
