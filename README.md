@@ -84,9 +84,20 @@ The Paprika API rate-limits. `add_groceries` reads the list, the aisles and
 the ingredient-aisle memory once each and posts every row together, so a
 40-item shopping list is four requests rather than well over a hundred.
 
-Recipe listing is cached on the sync index hash. The first search after Home
-Assistant starts walks the whole recipe index once (one request per recipe,
-trashed ones included); later searches cost a single request.
+Paprika's sync index lists recipes by id and hash only, so knowing their names
+means fetching each recipe — one request apiece. The integration caches
+recipes against that hash and **saves the cache in Home Assistant's
+`.storage`**, so only the very first fill is expensive: after a restart a
+search costs one request plus whatever changed. A recipe edited elsewhere
+arrives with a new hash and is refetched, so the saved cache stays correct.
+Removing the integration deletes it.
+
+If Paprika starts refusing (HTTP 429) part-way through a fill, the fill stops
+at the first refusal instead of sending every remaining request into the same
+limit, keeps what it fetched, and reports how far it got. The next call picks
+up from there. Searches never present a partial library as complete, and
+creating a recipe stops before writing if its duplicate-name check could not
+finish.
 
 ### Aisles
 

@@ -21,6 +21,7 @@ from custom_components.paprika_llm.paprika_client import (  # noqa: E402
     MealNotFoundError,
     PaprikaAPIError,
     PaprikaClient,
+    PaprikaRateLimitError,
 )
 
 EXPECTED = {
@@ -242,3 +243,19 @@ async def test_read_recipe_splits_ingredients_and_reports_missing(client):
     assert (await _call(t, uid="GONE")).data["found"] is False
     with pytest.raises(HomeAssistantError):
         await _call(t)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_tells_the_model_to_wait(client):
+    client.list_recipes = AsyncMock(side_effect=PaprikaRateLimitError("loaded 4 of 124"))
+    with pytest.raises(HomeAssistantError) as exc:
+        await _call(tools(client)["search_recipes"])
+    assert "4 of 124" in str(exc.value) and "do not retry immediately" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_rewrapped_rate_limit_is_still_recognised(client):
+    client.create_recipe = AsyncMock(side_effect=PaprikaAPIError(
+        "Failed to create recipe: Request failed with status 429: slow down"))
+    with pytest.raises(HomeAssistantError, match="rate-limiting"):
+        await _call(tools(client)["create_recipe"], name="X", ingredients=["a"], directions="b")

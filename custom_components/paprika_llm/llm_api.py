@@ -32,7 +32,14 @@ from .paprika_client import (
     MealNotFoundError,
     PaprikaAPIError,
     PaprikaClient,
+    PaprikaRateLimitError,
     ValidationError,
+)
+
+RATE_LIMITED = (
+    "Paprika is rate-limiting requests right now. Nothing was changed. Tell the "
+    "user and suggest trying again in a few minutes; do not retry immediately, "
+    "which only extends the limit."
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -123,7 +130,12 @@ class PaprikaTool(llm.Tool):
             ) from err
         except (MealNotFoundError, ValidationError) as err:
             raise HomeAssistantError(str(err)) from err
+        except PaprikaRateLimitError as err:
+            raise HomeAssistantError(f"{err} {RATE_LIMITED}") from err
         except PaprikaAPIError as err:
+            # Some client methods re-wrap errors, which hides the subclass.
+            if "status 429" in str(err):
+                raise HomeAssistantError(RATE_LIMITED) from err
             raise HomeAssistantError(f"Paprika request failed: {err}") from err
 
     async def _run(self, args: dict[str, Any]) -> JsonObjectType:

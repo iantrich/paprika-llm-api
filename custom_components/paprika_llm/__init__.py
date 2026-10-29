@@ -9,19 +9,45 @@ no transport, no OAuth and no remote-access configuration.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.storage import Store
 
 from . import llm_api
-from .const import LLM_API_ID, LLM_API_NAME
+from .const import DOMAIN, LLM_API_ID, LLM_API_NAME
 from .paprika_client import PaprikaAPIError, PaprikaClient
 
 _LOGGER = logging.getLogger(__name__)
 
-type PaprikaConfigEntry = ConfigEntry[PaprikaClient]
+STORAGE_VERSION = 1
+# Batch cache writes: a recipe walk changes many entries in quick succession.
+CACHE_SAVE_DELAY = 30
+
+
+@dataclass
+class PaprikaRuntime:
+    """What a loaded entry holds on to."""
+
+    client: PaprikaClient
+    cache_store: Store
+
+
+type PaprikaConfigEntry = ConfigEntry[PaprikaRuntime]
+
+
+def _cache_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
+    """Storage for this entry's recipe cache, in Home Assistant's .storage.
+
+    Persisting the cache is what keeps a restart from re-walking the whole
+    recipe library -- one request per recipe -- which runs into Paprika's rate
+    limit. The sync index hash keeps a loaded cache correct: a recipe changed
+    while Home Assistant was down arrives with a new hash and is refetched.
+    """
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.recipe_cache.{entry.entry_id}")
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: PaprikaConfigEntry) -> bool:
@@ -43,7 +69,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: PaprikaConfigEntry) -> b
         await client.close()
         raise ConfigEntryNotReady(f"Could not set up Paprika: {err}") from err
 
-    entry.runtime_data = client
+    cache_store = _cache_store(hass, entry)
+    try:
+        stored = await cache_store.async_load()
+    except Exception:  # noqa: BLE001 - a bad cache file only costs a refetch
+        _LOGGER.warning("Ignoring unreadable Paprika recipe cache")
+        stored = None
+    if stored:
+        loaded = client.import_recipe_cache(stored)
+        _LOGGER.debug("Loaded %s cached Paprika recipes", loaded)
+    client.on_recipe_cache_changed = lambda: cache_store.async_delay_save(
+        client.export_recipe_cache, CACHE_SAVE_DELAY
+    )
+
+    entry.runtime_data = PaprikaRuntime(client=client, cache_store=cache_store)
     entry.async_on_unload(
         llm_api.async_register(hass, LLM_API_ID, LLM_API_NAME, client)
     )
@@ -59,5 +98,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: PaprikaConfigEntry) -> 
     callback: a fire-and-forget close task can be abandoned if Home Assistant
     is shutting down, leaking the aiohttp session.
     """
-    await entry.runtime_data.close()
+    runtime = entry.runtime_data
+    # Write the cache now rather than leave it to the delayed save, which an
+    # unload would otherwise abandon.
+    await runtime.cache_store.async_save(runtime.client.export_recipe_cache())
+    await runtime.client.close()
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the stored recipe cache when the integration is removed."""
+    await _cache_store(hass, entry).async_remove()

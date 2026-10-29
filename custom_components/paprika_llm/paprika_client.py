@@ -33,6 +33,20 @@ class PaprikaAPIError(Exception):
     pass
 
 
+class PaprikaRateLimitError(PaprikaAPIError):
+    """Paprika answered 429. Retrying immediately only extends the block."""
+
+    pass
+
+
+def _raise_for_status(status: int, detail: str = "") -> None:
+    """Raise the right error for a non-success Paprika response."""
+    message = f"Request failed with status {status}" + (f": {detail}" if detail else "")
+    if status == 429:
+        raise PaprikaRateLimitError(message)
+    raise PaprikaAPIError(message)
+
+
 class ValidationError(Exception):
     """Custom exception for input validation errors."""
 
@@ -82,6 +96,10 @@ class PaprikaClient:
         # Serialises cache fills so two concurrent callers on a cold cache do not
         # both walk the whole library.
         self._recipe_cache_lock = asyncio.Lock()
+        # Called after the cache gains or loses entries, so a host can persist
+        # it. Without persistence every restart re-walks the whole library,
+        # which is what runs into Paprika's rate limit.
+        self.on_recipe_cache_changed: Optional[Any] = None
         self.token: Optional[str] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.image_generator = image_generator
@@ -172,17 +190,12 @@ class PaprikaClient:
                         **kwargs,
                     ) as retry_response:
                         if retry_response.status != 200:
-                            raise PaprikaAPIError(
-                                f"Request failed with status {retry_response.status}"
-                            )
+                            _raise_for_status(retry_response.status)
 
                         return await retry_response.json()
 
                 elif response.status != 200:
-                    error_text = await response.text()
-                    raise PaprikaAPIError(
-                        f"Request failed with status {response.status}: {error_text}"
-                    )
+                    _raise_for_status(response.status, await response.text())
 
                 return await response.json()
 
@@ -205,10 +218,7 @@ class PaprikaClient:
                 method, f"{self.BASE_URL}/v1{endpoint}", headers=headers, **kwargs
             ) as response:
                 if response.status not in (200, 201, 204):
-                    error_text = await response.text()
-                    raise PaprikaAPIError(
-                        f"Request failed with status {response.status}: {error_text}"
-                    )
+                    _raise_for_status(response.status, await response.text())
 
                 if response.status == 204:
                     return {}
@@ -584,13 +594,16 @@ class PaprikaClient:
             uid -> recipe data, skipping any recipe that failed to fetch.
         """
         async with self._recipe_cache_lock:
+            pruned = 0
             if prune:
                 live = {e["uid"] for e in index_entries}
                 for gone in self._recipe_cache.keys() - live:
                     del self._recipe_cache[gone]
+                    pruned += 1
 
             resolved: Dict[str, Dict[str, Any]] = {}
             fetched = 0
+            rate_limited = False
             for entry in index_entries:
                 uid = entry["uid"]
                 entry_hash = entry.get("hash")
@@ -604,6 +617,12 @@ class PaprikaClient:
                     recipe_response = await self._make_authenticated_request(
                         "GET", f"/sync/recipe/{uid}/"
                     )
+                except PaprikaRateLimitError:
+                    # Stop at the first refusal. Carrying on would send every
+                    # remaining request into the same wall, extend the block,
+                    # and -- as before -- silently drop those recipes.
+                    rate_limited = True
+                    break
                 except Exception as e:
                     logger.warning(f"Failed to fetch recipe {uid}: {str(e)}")
                     continue
@@ -624,7 +643,49 @@ class PaprikaClient:
                 f"Resolved {len(resolved)} recipes "
                 f"({fetched} fetched, {len(resolved) - fetched} from cache)"
             )
+            if (fetched or pruned) and self.on_recipe_cache_changed:
+                # Persist progress even when cut short, so the next call
+                # resumes instead of starting over.
+                self.on_recipe_cache_changed()
+            if rate_limited:
+                raise PaprikaRateLimitError(
+                    f"Paprika is rate-limiting requests; loaded {len(resolved)} of "
+                    f"{len(index_entries)} recipes before it refused. Progress is "
+                    "saved, so trying again in a few minutes picks up from here."
+                )
             return resolved
+
+    def export_recipe_cache(self) -> Dict[str, Any]:
+        """Serialise the recipe cache for storage.
+
+        Trashed recipes are kept only as a stub: the cache needs to know they
+        are trashed, not what is in them.
+        """
+        recipes: Dict[str, Any] = {}
+        for uid, (entry_hash, recipe) in self._recipe_cache.items():
+            if recipe.get("in_trash"):
+                recipe = {"uid": uid, "name": recipe.get("name"), "in_trash": True}
+            recipes[uid] = {"hash": entry_hash, "recipe": recipe}
+        return {"recipes": recipes}
+
+    def import_recipe_cache(self, data: Any) -> int:
+        """Load a cache produced by export_recipe_cache. Returns entries loaded.
+
+        Anything malformed is skipped rather than trusted: a bad entry costs
+        one refetch, a bad entry trusted could serve the wrong recipe.
+        """
+        loaded = 0
+        recipes = data.get("recipes") if isinstance(data, dict) else None
+        if not isinstance(recipes, dict):
+            return 0
+        for uid, item in recipes.items():
+            if not isinstance(item, dict):
+                continue
+            entry_hash, recipe = item.get("hash"), item.get("recipe")
+            if isinstance(entry_hash, str) and isinstance(recipe, dict):
+                self._recipe_cache[uid] = (entry_hash, recipe)
+                loaded += 1
+        return loaded
 
     async def get_recipe_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """
@@ -667,6 +728,8 @@ class PaprikaClient:
             logger.info(f"No recipe found with title: {title}")
             return None
 
+        except PaprikaRateLimitError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get recipe by title {title}: {str(e)}")
             raise PaprikaAPIError(f"Failed to get recipe by title: {str(e)}")
@@ -1232,6 +1295,8 @@ class PaprikaClient:
             logger.info(f"Successfully fetched {len(recipes)} recipes")
             return recipes
 
+        except PaprikaRateLimitError:
+            raise
         except Exception as e:
             logger.error(f"Failed to list recipes: {str(e)}")
             raise PaprikaAPIError(f"Failed to list recipes: {str(e)}")
