@@ -30,7 +30,8 @@ operating all of the above yourself.
 Built around one workflow: **plan the week's meals, then put everything
 they need on the grocery list, minus what's already in the pantry.**
 
-1. Pick recipes with `search_recipes` and schedule them with `add_meal_to_plan`.
+1. Pick recipes with `search_recipes` and schedule them with `add_meal_to_plan`;
+   add side dishes as notes with `add_note_to_plan`.
 2. `get_meal_plan_ingredients` returns every planned meal's ingredient lines
    plus the in-stock pantry, in a handful of requests.
 3. The model merges ingredients across meals, applies each meal's scale, drops
@@ -56,7 +57,8 @@ judgment rather than a string-matching parser. The tools do data access.
 | `paprika_llm__list_meal_plan` | read-only |
 | `paprika_llm__get_meal_plan_ingredients` | read-only; ingredients for planned meals, plus in-stock pantry |
 | `paprika_llm__add_meal_to_plan` | write; refuses ambiguous recipe names rather than guessing |
-| `paprika_llm__remove_meal_from_plan` | write, **destructive**; requires a date or recipe |
+| `paprika_llm__add_note_to_plan` | write; free-text entry such as a side dish, listed after the day's main dish |
+| `paprika_llm__remove_meal_from_plan` | write, **destructive**; removes a meal or note; requires a date, recipe or note text |
 | `paprika_llm__get_grocery_lists` | read-only |
 | `paprika_llm__get_grocery_aisles` | read-only |
 | `paprika_llm__get_groceries` | read-only |

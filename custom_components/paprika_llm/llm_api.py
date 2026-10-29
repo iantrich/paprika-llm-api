@@ -53,8 +53,9 @@ API_PROMPT = (
     "in-stock pantry already covers. Before adding, show the user the list and "
     "what you are skipping as pantry, and get their confirmation. Then add "
     "everything in one add_groceries call rather than one add_grocery per item.\n"
-    "Meals of kind 'note' are free text with no recipe; ask whether the note "
-    "itself is something to buy.\n"
+    "Meals of kind 'note' are free text with no recipe, typically side dishes "
+    "listed after the main dish; ask whether the note itself is something to "
+    "buy. Add sides with add_note_to_plan on the same date as the main dish.\n"
     "When the user says they already have something, offer to add it to the "
     "pantry with add_pantry_items so future lists skip it.\n"
     "Removals match exact names; read the list or pantry first and use the "
@@ -769,7 +770,8 @@ class ListMealPlanTool(PaprikaTool):
     title = "List Paprika meal plan"
     description = (
         "List planned meals in a date window. Meals of kind 'note' are free "
-        "text with no recipe attached."
+        "text with no recipe attached, usually side dishes. 'order' is the "
+        "position within the day: the main dish first, then its sides."
     )
     parameters = probatio.Schema(_WINDOW_FIELDS)
     annotations = READ_ONLY
@@ -791,6 +793,7 @@ class ListMealPlanTool(PaprikaTool):
                     "kind": "recipe" if m.get("meal_ID") else "note",
                     "recipe_uid": m.get("meal_ID") or None,
                     "scale": m.get("scale"),
+                    "order": m.get("order", 0),
                 }
                 for m in meals
             ]
@@ -864,21 +867,61 @@ class AddMealToPlanTool(PaprikaTool):
         }
 
 
+class AddNoteToPlanTool(PaprikaTool):
+    """Put free text, usually a side dish, on the plan."""
+
+    name = f"{TOOL_PREFIX}add_note_to_plan"
+    title = "Add a note to the Paprika plan"
+    description = (
+        "Add a free-text entry with no recipe to the meal plan, the way the "
+        "user lists side dishes (e.g. 'Steamed Broccoli', 'Jasmine Rice') "
+        "under a main dish. It is placed after whatever is already planned "
+        "for that meal. Use add_meal_to_plan for anything that is a recipe "
+        "in the library."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("note", description="The text, e.g. 'Side Salad'."): str,
+            probatio.Required("date", description=DATE_HELP): str,
+            probatio.Optional(
+                "meal_type", default="dinner", description="Which meal."
+            ): probatio.In(MEAL_TYPES),
+        }
+    )
+    annotations = WRITE_ADDITIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Add the note and report where it went."""
+        result = await self._client.add_note_to_plan(
+            note=args["note"],
+            date=args["date"],
+            meal_type=args.get("meal_type", "dinner"),
+        )
+        return {
+            "scheduled": True,
+            "date": result.get("date"),
+            "meal_type": result.get("type"),
+            "note": result.get("meal"),
+        }
+
+
 class RemoveMealFromPlanTool(PaprikaTool):
     """Unschedule one meal."""
 
     name = f"{TOOL_PREFIX}remove_meal_from_plan"
     title = "Remove a meal from the Paprika plan"
     description = (
-        "Remove one planned meal. Identify it by date, by recipe, or both; "
-        "giving both is the safest. This removes the meal from the plan, not "
-        "the recipe."
+        "Remove one planned meal or note. Identify it by date, by recipe or "
+        "note text (recipe_name), or both; giving both is the safest. This "
+        "removes the entry from the plan, not the recipe."
     )
     parameters = probatio.Schema(
         {
             probatio.Optional("date", description=DATE_HELP): str,
             probatio.Optional("recipe_uid", description="Recipe uid of the meal."): str,
-            probatio.Optional("recipe_name", description="Name of the meal."): str,
+            probatio.Optional(
+                "recipe_name", description="Name of the meal, or a note's text."
+            ): str,
             probatio.Optional(
                 "meal_type", default="dinner", description="Which meal."
             ): probatio.In(MEAL_TYPES),
@@ -965,6 +1008,7 @@ def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
             ListMealPlanTool,
             GetMealPlanIngredientsTool,
             AddMealToPlanTool,
+            AddNoteToPlanTool,
             RemoveMealFromPlanTool,
         )
     ]

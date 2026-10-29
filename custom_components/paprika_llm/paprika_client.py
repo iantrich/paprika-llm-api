@@ -1519,6 +1519,9 @@ class PaprikaClient:
                                 # A meal can be planned at a multiple of the
                                 # recipe; ingredient quantities scale with it.
                                 "scale": entry.get("scale"),
+                                # Position within the day: the main dish is
+                                # usually 0 and sides follow.
+                                "order": entry.get("order_flag") or 0,
                             })
                 except ValueError:
                     continue
@@ -1567,38 +1570,69 @@ class PaprikaClient:
             current_plan = await self.get_meal_plan(num_days=365, meal_type=None)
             parsed_date = self._get_next_free_day(current_plan, meal_type)
 
-        meal_entry_id = self._generate_uuid()
-        meal_type_map = {"breakfast": 1, "dinner": 2, "lunch": 3}
-        meal_type_int = meal_type_map.get(meal_type.lower(), 2)
-        date_with_time = f"{parsed_date} 00:00:00"
+        await self._post_meal_entry(recipe_name or "Unknown", recipe_uid, parsed_date, meal_type)
+        return {
+            "meal": recipe_name or "Unknown",
+            "meal_ID": recipe_uid,
+            "date": parsed_date,
+            "type": meal_type,
+        }
 
+    async def add_note_to_plan(
+        self, note: str, date: str, meal_type: str = "dinner"
+    ) -> Dict[str, Any]:
+        """Add a free-text note (e.g. a side dish) to the meal plan.
+
+        A note is a meal entry with no recipe, which is how the Paprika app
+        stores the sides users type in next to a main dish.
+        """
+        note = (note or "").strip()
+        if not note:
+            raise ValidationError("Note text is required")
+        if not date:
+            raise ValidationError("A date is required for a note")
+        parsed_date = self._parse_flexible_date(date)
+        await self._post_meal_entry(note, None, parsed_date, meal_type)
+        return {"meal": note, "meal_ID": None, "date": parsed_date, "type": meal_type}
+
+    async def _post_meal_entry(
+        self,
+        name: str,
+        recipe_uid: Optional[str],
+        parsed_date: str,
+        meal_type: str,
+    ) -> None:
+        """Append one entry to a day's meal plan.
+
+        The entry goes after whatever is already planned for that meal, so a
+        side added after the main dish is listed below it, as in the app.
+        """
+        day = await self.get_meal_plan(
+            start_date=parsed_date, end_date=parsed_date, meal_type=meal_type
+        )
+        order = max((m.get("order", 0) for m in day), default=-1) + 1
+
+        meal_type_map = {"breakfast": 1, "dinner": 2, "lunch": 3}
         meal_entry = {
-            "uid": meal_entry_id,
+            "uid": self._generate_uuid(),
             "recipe_uid": recipe_uid,
-            "name": recipe_name or "Unknown",
-            "date": date_with_time,
-            "type": meal_type_int,
-            "order_flag": 0,
+            "name": name,
+            "date": f"{parsed_date} 00:00:00",
+            "type": meal_type_map.get(meal_type.lower(), 2),
+            "order_flag": order,
             "deleted": False,
         }
 
         try:
-            meals_array = [meal_entry]
-            gzipped_data = self._gzip_json(meals_array)
             data = aiohttp.FormData()
             data.add_field(
-                "data", gzipped_data, content_type="application/octet-stream", filename="data"
+                "data",
+                BytesIO(self._gzip_json([meal_entry])),
+                filename="data",
+                content_type="application/octet-stream",
             )
             await self._make_v1_basic_auth_request("POST", "/sync/meals/", data=data)
-
-            logger.info(f"Successfully added meal '{recipe_name}' to meal plan on {parsed_date}")
-            return {
-                "meal": recipe_name or "Unknown",
-                "meal_ID": recipe_uid,
-                "date": parsed_date,
-                "type": meal_type,
-            }
-
+            logger.info(f"Added '{name}' to the meal plan on {parsed_date}")
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Failed to add meal to plan: {error_msg}")
