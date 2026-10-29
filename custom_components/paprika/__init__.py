@@ -47,12 +47,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: PaprikaConfigEntry) -> b
     entry.async_on_unload(
         llm_api.async_register(hass, LLM_API_ID, LLM_API_NAME, client)
     )
-    entry.async_on_unload(lambda: hass.async_create_task(client.close()))
 
     _LOGGER.info("Paprika LLM API registered as %s", LLM_API_ID)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: PaprikaConfigEntry) -> bool:
-    """Unload the entry. Registered callbacks handle deregistration."""
+    """Deregister the API and close the client session.
+
+    The client is closed here and awaited rather than in an async_on_unload
+    callback: a fire-and-forget close task can be abandoned if Home Assistant
+    is shutting down, leaking the aiohttp session.
+    """
+    await entry.runtime_data.close()
     return True
