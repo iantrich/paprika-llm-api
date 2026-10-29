@@ -27,28 +27,59 @@ operating all of the above yourself.
 
 ## Status
 
-**Groceries are complete. Recipes and meal planning are next.**
+Built around one workflow: **plan the week's meals, then put everything
+they need on the grocery list, minus what's already in the pantry.**
+
+1. Pick recipes with `search_recipes` and schedule them with `add_meal_to_plan`.
+2. `get_meal_plan_ingredients` returns every planned meal's ingredient lines
+   plus the in-stock pantry, in a handful of requests.
+3. The model merges ingredients across meals, applies each meal's scale, drops
+   what the pantry covers, and shows you the result — including what it
+   skipped — before writing anything.
+4. `add_groceries` writes the whole list in one request.
+
+Ingredient lines are free text (`2 tablespoons soy sauce` against a pantry
+entry `soy sauce`), so merging and pantry matching are left to the model's
+judgment rather than a string-matching parser. The tools do data access.
 
 | Tool | Behaviour |
 |---|---|
+| `paprika_llm__search_recipes` | read-only; lists everything when no query is given |
+| `paprika_llm__list_meal_plan` | read-only |
+| `paprika_llm__get_meal_plan_ingredients` | read-only; ingredients for planned meals, plus in-stock pantry |
+| `paprika_llm__add_meal_to_plan` | write; refuses ambiguous recipe names rather than guessing |
+| `paprika_llm__remove_meal_from_plan` | write, **destructive**; requires a date or recipe |
 | `paprika_llm__get_grocery_lists` | read-only |
 | `paprika_llm__get_grocery_aisles` | read-only |
 | `paprika_llm__get_groceries` | read-only |
 | `paprika_llm__get_grocery` | read-only |
-| `paprika_llm__add_grocery` | write, additive, not idempotent; optional `aisle` |
+| `paprika_llm__add_grocery` | write, additive; optional `aisle` |
+| `paprika_llm__add_groceries` | write, additive; many items in one request |
 | `paprika_llm__clear_grocery_list` | write, **destructive** |
 
-Each tool declares Home Assistant `ToolAnnotations`. The defaults describe the
-least safe case, so reads opt in to `read_only` explicitly and
-`clear_grocery_list` is marked `destructive` for clients that surface it.
+Meals planned as free-text notes (no recipe attached) are returned as kind
+`note` with no ingredients, not dropped.
+
+`delete_recipe` is deliberately omitted and will stay omitted.
+
+### Request budget
+
+The Paprika API rate-limits. `add_groceries` reads the list, the aisles and
+the ingredient-aisle memory once each and posts every row together, so a
+40-item shopping list is four requests rather than well over a hundred.
+
+Recipe listing is cached on the sync index hash. The first search after Home
+Assistant starts walks the whole recipe index once (one request per recipe,
+trashed ones included); later searches cost a single request.
 
 ### Aisles
 
-`add_grocery` takes an optional `aisle`, matched case-insensitively against
-the account's own aisle names (which may be numbers like `1`–`6` rather than
-categories — `get_grocery_aisles` lists them). `"aisle 5"` matches an aisle
-named `5`. An unknown aisle is an error that lists the real ones; aisles are
-never created implicitly.
+`add_grocery` and `add_groceries` take an optional `aisle`, matched
+case-insensitively against the account's own aisle names (which may be numbers
+like `1`–`6` rather than categories — `get_grocery_aisles` lists them).
+`"aisle 5"` matches an aisle named `5`. An unknown aisle is an error that
+lists the real ones, and in a batch it fails the whole request before
+anything is written. Aisles are never created implicitly.
 
 Without an aisle:
 
@@ -57,12 +88,18 @@ Without an aisle:
    (`/sync/groceryingredients/` — the same memory the Paprika apps sort by);
 3. otherwise it goes to `Miscellaneous`.
 
-Still to port: the six recipe tools (`list_recipes`, `read_recipe`,
-`search_recipes`, `filter_recipes_by_ingredient`, `filter_recipes_by_time`,
-`create_recipe`, `update_recipe`) and the three meal-plan tools
-(`list_meal_plan`, `add_meal_to_plan`, `remove_meal_from_plan`).
+## Not the same as `rbrunt/paprika-ha`
 
-`delete_recipe` is deliberately omitted and will stay omitted.
+This integration uses the domain `paprika_llm`, deliberately. The unofficial
+[Paprika Recipes](https://github.com/rbrunt/paprika-ha) integration uses
+`paprika`, and two integrations cannot share a domain — HACS installs both into
+`custom_components/<domain>/`, so a collision silently overwrites one with the
+other and Home Assistant then hands one integration's config entry to the
+other's code.
+
+The two do different things and can be installed side by side: that one
+exposes the meal plan as calendar entities; this one exposes tools to MCP
+clients.
 
 ## Requirements
 
@@ -86,6 +123,19 @@ Still to port: the six recipe tools (`list_recipes`, `read_recipe`,
 Your Paprika credentials are held in Home Assistant's config entry store. They
 are never written to a file by this integration and are never returned by any
 tool, so they cannot reach a model's context.
+
+## Development
+
+```bash
+pip install homeassistant==2026.10.2 mcp==1.28.1 aiohttp_sse==2.2.0 \
+    hassil==3.12.1 home-assistant-intents==2026.10.6 gazetteer-matcher==1.1.0 \
+    python-dateutil pytest pytest-asyncio
+pytest -p no:anyio
+```
+
+`tests/test_tools.py` renders every tool through Home Assistant's own
+`mcp_server` formatter, so a schema the client cannot use, or a parameter
+without a description, fails the suite.
 
 ## Attribution
 
