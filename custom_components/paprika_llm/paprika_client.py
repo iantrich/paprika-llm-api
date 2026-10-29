@@ -1292,7 +1292,7 @@ class PaprikaClient:
 
                 recipes.append(recipe_data)
 
-            logger.info(f"Successfully fetched {len(recipes)} recipes")
+            logger.debug(f"Listed {len(recipes)} recipes (trash excluded)")
             return recipes
 
         except PaprikaRateLimitError:
