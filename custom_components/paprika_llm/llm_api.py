@@ -15,10 +15,12 @@ the `description=` on each field is what the model reads.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
 
+import aiohttp
 import probatio
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -35,6 +37,7 @@ from .paprika_client import (
     PaprikaRateLimitError,
     ValidationError,
 )
+from .recipe_import import RecipeImportError, fetch_image, fetch_page, parse_recipe
 
 RATE_LIMITED = (
     "Paprika is rate-limiting requests right now. Nothing was changed. Tell the "
@@ -60,6 +63,8 @@ API_PROMPT = (
     "pantry with add_pantry_items so future lists skip it.\n"
     "Removals match exact names; read the list or pantry first and use the "
     "names as shown.\n"
+    "To add a recipe from a link, preview it with import_recipe_from_url, "
+    "show the user, then call it again with save=true.\n"
     "To edit a recipe, read it with read_recipe first, show the user exactly "
     "what will change, and confirm before calling update_recipe.\n"
     "Grocery aisle names are the user's own (see get_grocery_aisles)."
@@ -706,6 +711,108 @@ class CreateRecipeTool(PaprikaTool):
         return {"created": True, "uid": recipe.get("uid"), "name": recipe.get("name")}
 
 
+def _same_page(a: str, b: str) -> bool:
+    """Compare recipe links, ignoring scheme, trailing slash and case."""
+    def norm(url: str) -> str:
+        return url.strip().lower().split("://", 1)[-1].removeprefix("www.").rstrip("/")
+    return bool(a and b) and norm(a) == norm(b)
+
+
+class ImportRecipeFromUrlTool(PaprikaTool):
+    """Import a recipe from a web page."""
+
+    name = f"{TOOL_PREFIX}import_recipe_from_url"
+    title = "Import a recipe from a web link"
+    description = (
+        "Read a recipe from a recipe web page (the structured data most "
+        "recipe sites publish) and add it to Paprika with its photo, source "
+        "and link. By default this only returns a preview; show it to the "
+        "user and call again with save=true once they confirm. A page "
+        "already imported, or a name already in the library, is refused."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("url", description="Link to the recipe page."): str,
+            probatio.Optional(
+                "save",
+                default=False,
+                description="False previews the recipe; true adds it to Paprika.",
+            ): bool,
+            probatio.Optional(
+                "name", description="Name to save it under instead of the page's title."
+            ): str,
+        }
+    )
+    annotations = WRITE_ADDITIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Preview or save the page's recipe."""
+        session = await self._client._get_session()
+        try:
+            page_url, page = await fetch_page(session, args["url"])
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise RecipeImportError(
+                f"Could not load {args['url']}: {err or type(err).__name__}"
+            ) from err
+        recipe = parse_recipe(page, page_url)
+        if args.get("name", "").strip():
+            recipe["name"] = args["name"].strip()
+
+        notes = f"Yield: {recipe['yield_text']}" if recipe["yield_text"] else ""
+        summary = {
+            "name": recipe["name"],
+            "ingredients": recipe["ingredients"],
+            "directions": recipe["directions"],
+            "description": recipe["description"],
+            "servings": recipe["servings"],
+            "notes": notes,
+            "prep_time": recipe["prep_time"],
+            "cook_time": recipe["cook_time"],
+            "total_time": recipe["total_time"],
+            "source": recipe["source"],
+            "source_url": recipe["source_url"],
+            "has_photo": bool(recipe["image_url"]),
+        }
+        if not args.get("save"):
+            return {"saved": False, "preview": summary}
+
+        for existing in await self._client.list_recipes(limit=100000):
+            link = existing.get("source_url") or ""
+            if _same_page(link, page_url) or _same_page(link, args["url"]):
+                raise RecipeImportError(
+                    f"This page is already in the library as "
+                    f"'{existing.get('name')}' (uid {existing.get('uid')})."
+                )
+
+        photo = (
+            await fetch_image(session, recipe["image_url"])
+            if recipe["image_url"]
+            else None
+        )
+        # No AI image: the page's own photo is the one the user expects.
+        created = await self._client.create_recipe(
+            name=recipe["name"],
+            ingredients="\n".join(recipe["ingredients"]),
+            directions=recipe["directions"],
+            description=recipe["description"],
+            notes=notes,
+            servings=recipe["servings"],
+            prep_time=recipe["prep_time"],
+            cook_time=recipe["cook_time"],
+            total_time=recipe["total_time"],
+            source=recipe["source"],
+            source_url=recipe["source_url"],
+            photo=photo,
+            generate_image=False,
+        )
+        return {
+            "saved": True,
+            "uid": created.get("uid"),
+            "name": created.get("name"),
+            "photo_attached": photo is not None,
+        }
+
+
 class UpdateRecipeTool(PaprikaTool):
     """Edit an existing recipe."""
 
@@ -1003,6 +1110,7 @@ def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
             SearchRecipesTool,
             ReadRecipeTool,
             CreateRecipeTool,
+            ImportRecipeFromUrlTool,
             UpdateRecipeTool,
             # meal plan
             ListMealPlanTool,

@@ -28,7 +28,7 @@ EXPECTED = {
     "get_grocery_lists", "get_grocery_aisles", "get_groceries", "get_grocery",
     "add_grocery", "add_groceries", "remove_groceries", "clear_grocery_list",
     "get_pantry", "add_pantry_items", "remove_pantry_items", "search_recipes",
-    "read_recipe", "create_recipe", "update_recipe",
+    "read_recipe", "create_recipe", "import_recipe_from_url", "update_recipe",
     "list_meal_plan", "get_meal_plan_ingredients", "add_meal_to_plan",
     "add_note_to_plan",
     "remove_meal_from_plan",

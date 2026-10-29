@@ -946,6 +946,10 @@ class PaprikaClient:
         cook_time: str = "",
         difficulty: str = "",
         generate_image: bool = True,
+        total_time: str = "",
+        source: str = "",
+        source_url: str = "",
+        photo: Optional[Tuple[bytes, str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a new recipe in Paprika.
@@ -1029,10 +1033,21 @@ class PaprikaClient:
             cook_time=cook_time,
             difficulty=difficulty,
         )
+        recipe["total_time"] = total_time
+        recipe["source"] = source
+        recipe["source_url"] = source_url
 
         # Prepare image for upload if generation succeeded
         photo_filename = None
-        if image_url:
+        photo_type = "image/png"
+        if photo:
+            image_data, ext = photo
+            photo_filename = f"{self._generate_uuid()}.{ext}"
+            photo_type = {"jpg": "image/jpeg", "webp": "image/webp"}.get(ext, "image/png")
+            recipe["photo"] = photo_filename
+            recipe["photo_hash"] = hashlib.sha256(image_data).hexdigest().upper()
+            recipe["photo_large"] = photo_filename
+        elif image_url:
             image_result = await self._prepare_image_for_recipe(recipe, image_url)
             if image_result:
                 image_data, photo_filename = image_result
@@ -1057,7 +1072,7 @@ class PaprikaClient:
                 "photo_upload",
                 image_data,
                 filename=photo_filename,
-                content_type="image/png"
+                content_type=photo_type,
             )
             logger.info(f"Uploading recipe with photo_upload field: {photo_filename}")
 

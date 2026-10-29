@@ -53,6 +53,7 @@ judgment rather than a string-matching parser. The tools do data access.
 | `paprika_llm__search_recipes` | read-only; lists everything when no query is given |
 | `paprika_llm__read_recipe` | read-only; full ingredients, method and notes |
 | `paprika_llm__create_recipe` | write; refuses a name that already exists |
+| `paprika_llm__import_recipe_from_url` | preview by default; `save=true` writes, with the page's photo, source and link; refuses a page already imported |
 | `paprika_llm__update_recipe` | write, **destructive**; changes only the fields given |
 | `paprika_llm__list_meal_plan` | read-only |
 | `paprika_llm__get_meal_plan_ingredients` | read-only; ingredients for planned meals, plus in-stock pantry |
@@ -116,6 +117,21 @@ Without an aisle:
 2. a new item goes where Paprika remembers that ingredient belongs
    (`/sync/groceryingredients/` — the same memory the Paprika apps sort by);
 3. otherwise it goes to `Miscellaneous`.
+
+### Importing from a link
+
+`import_recipe_from_url` reads the schema.org `Recipe` data that most recipe
+sites embed for search engines, the same data Paprika's own browser import
+relies on. Pages without it are reported rather than guessed at. Times are
+converted to Paprika's style (`PT1H10M` → `1 hr 10 mins`), a yield like
+`1 loaf` is kept in the notes, and the page's photo is uploaded when it is a
+JPEG, PNG or WebP; a photo that cannot be fetched never blocks the import.
+
+Fetching is limited to public http(s) addresses, checked again on every
+redirect, so a link can never make Home Assistant fetch something on the local
+network. Requests identify themselves honestly; some large publishers
+(Allrecipes, Simply Recipes, Serious Eats) refuse them, and those recipes are
+best imported with the Paprika app's own browser.
 
 ## Not the same as `rbrunt/paprika-ha`
 
