@@ -1,12 +1,16 @@
 {
-  "domain": "paprika",
-  "name": "Paprika Recipe Manager",
-  "codeowners": ["@iantrich"],
+  "domain": "paprika_llm",
+  "name": "Paprika LLM API",
+  "codeowners": [
+    "@iantrich"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/iantrich/paprika-llm-api",
   "integration_type": "service",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/iantrich/paprika-llm-api/issues",
-  "requirements": ["python-dateutil>=2.8.2"],
+  "requirements": [
+    "python-dateutil>=2.8.2"
+  ],
   "version": "0.1.0"
 }

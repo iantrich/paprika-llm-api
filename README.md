@@ -1,4 +1,4 @@
-# Paprika Recipe Manager — Home Assistant LLM API
+# Paprika LLM API — Home Assistant
 
 Exposes your [Paprika Recipe Manager](https://www.paprikaapp.com/) recipes,
 grocery lists and meal plan to LLM clients as a Home Assistant **LLM API**.
@@ -29,9 +29,20 @@ operating all of the above yourself.
 
 **Early. One tool, deliberately.**
 
-`paprika__get_grocery_lists` exists to prove the whole chain end to end:
+`paprika_llm__get_grocery_lists` exists to prove the whole chain end to end:
 custom LLM API registration → exposure via `mcp_server` → remote reachability
 → OAuth from the client. The remaining tools are ported once that holds.
+
+## Not the same as `rbrunt/paprika-ha`
+
+This integration uses the domain `paprika_llm`, deliberately. The unofficial
+[Paprika Recipes](https://github.com/rbrunt/paprika-ha) integration uses
+`paprika`, and two integrations cannot share a domain — HACS installs both into
+`custom_components/<domain>/`, so a collision silently overwrites one with the
+other and Home Assistant then hands one integration's config entry to the
+other's code.
+
+The two do different things and can be installed side by side.
 
 ## Requirements
 
@@ -43,10 +54,10 @@ custom LLM API registration → exposure via `mcp_server` → remote reachabilit
 
 ## Installation
 
-1. Copy `custom_components/paprika` into your Home Assistant `config/custom_components/`
+1. Copy `custom_components/paprika_llm` into your Home Assistant `config/custom_components/`
    directory, or add this repository to HACS as a custom integration.
 2. Restart Home Assistant.
-3. **Settings → Devices & Services → Add Integration → Paprika Recipe Manager**,
+3. **Settings → Devices & Services → Add Integration → Paprika LLM API**,
    and sign in with your Paprika account.
 4. Open the **Model Context Protocol Server** integration's options and enable
    the **Paprika** API under *Control Home Assistant* (or leave *Expose all LLM
@@ -58,7 +69,7 @@ tool, so they cannot reach a model's context.
 
 ## Attribution
 
-`custom_components/paprika/paprika_client.py` is vendored from
+`custom_components/paprika_llm/paprika_client.py` is vendored from
 [paprika-mcp-python-server](https://github.com/sandordaroczi/paprika-mcp-python-server)
 by Sándor Daróczi (MIT), via
 [iantrich/paprika-mcp-python-server](https://github.com/iantrich/paprika-mcp-python-server),
