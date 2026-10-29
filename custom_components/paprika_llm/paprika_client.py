@@ -979,7 +979,14 @@ class PaprikaClient:
 
         # Create multipart form data with recipe + optional photo
         data = aiohttp.FormData()
-        data.add_field("data", self._gzip_json(recipe), content_type="application/octet-stream")
+        # BytesIO plus a filename: aiohttp stops treating raw bytes as a file
+        # field in v4, which would silently break recipe uploads.
+        data.add_field(
+            "data",
+            BytesIO(self._gzip_json(recipe)),
+            filename="recipe.json.gz",
+            content_type="application/octet-stream",
+        )
 
         # Add photo_upload field if we have an image (required for Paprika to accept photos)
         if image_data and photo_filename:
@@ -1127,8 +1134,10 @@ class PaprikaClient:
                 if value is not None and value != "":
                     existing_recipe[field] = value
 
-            # Recalculate hash and update timestamp
-            existing_recipe["created"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Recalculate the hash, which is how Paprika's sync detects the
+            # change. "created" is deliberately left alone: it is the date the
+            # recipe was added, and overwriting it made every edit look like a
+            # newly added recipe.
             existing_recipe["hash"] = self._calculate_hash(existing_recipe)
 
             # Gzip the recipe data
@@ -1137,7 +1146,10 @@ class PaprikaClient:
             # Create multipart form data
             data = aiohttp.FormData()
             data.add_field(
-                "data", gzipped_data, content_type="application/octet-stream"
+                "data",
+                BytesIO(gzipped_data),
+                filename="recipe.json.gz",
+                content_type="application/octet-stream",
             )
 
             await self._make_authenticated_request(

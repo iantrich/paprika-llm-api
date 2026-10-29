@@ -27,6 +27,7 @@ EXPECTED = {
     "get_grocery_lists", "get_grocery_aisles", "get_groceries", "get_grocery",
     "add_grocery", "add_groceries", "remove_groceries", "clear_grocery_list",
     "get_pantry", "add_pantry_items", "remove_pantry_items", "search_recipes",
+    "read_recipe", "create_recipe", "update_recipe",
     "list_meal_plan", "get_meal_plan_ingredients", "add_meal_to_plan",
     "remove_meal_from_plan",
 }
@@ -42,7 +43,10 @@ def tools(client):
 
 
 def _call(tool, **args):
-    return tool.async_call(None, llm.ToolInput(tool_name=tool.name, tool_args=args), None)
+    """Call a tool the way Home Assistant does: arguments go through the tool's
+    schema first, so defaults and coercions apply before the tool runs."""
+    validated = tool.parameters(args)
+    return tool.async_call(None, llm.ToolInput(tool_name=tool.name, tool_args=validated), None)
 
 
 # --- shape ----------------------------------------------------------------
@@ -83,6 +87,9 @@ def test_annotations_reach_the_client(client):
     assert hints["remove_groceries"].destructiveHint is True
     assert hints["remove_pantry_items"].destructiveHint is True
     assert hints["get_pantry"].readOnlyHint is True
+    assert hints["read_recipe"].readOnlyHint is True
+    assert hints["update_recipe"].destructiveHint is True
+    assert hints["create_recipe"].destructiveHint is False
     assert hints["add_pantry_items"].destructiveHint is False
     assert hints["add_pantry_items"].idempotentHint is True
     assert hints["remove_meal_from_plan"].destructiveHint is True
@@ -187,3 +194,51 @@ async def test_prompt_carries_todays_date(client):
     instance = await api.async_get_api_instance(ctx)
     assert instance.api_prompt.startswith("Today is ")
     assert len(instance.tools) == len(EXPECTED)
+
+
+# --- recipes --------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_update_sends_only_given_fields_through_the_partial_path(client):
+    client.update_recipe_partial = AsyncMock(return_value={"uid": "R1", "name": "Chili"})
+    client.update_recipe = AsyncMock()
+    result = await _call(tools(client)["update_recipe"], uid="R1",
+                         notes="Use less salt", ingredients=["2 lb beef", " ", "1 onion"])
+    client.update_recipe_partial.assert_awaited_once_with(
+        "R1", notes="Use less salt", ingredients="2 lb beef\n1 onion")
+    client.update_recipe.assert_not_awaited()  # the full-replace path drops fields
+    assert result.data["changed_fields"] == ["ingredients", "notes"]
+
+
+@pytest.mark.asyncio
+async def test_update_with_nothing_to_change_is_refused(client):
+    client.update_recipe_partial = AsyncMock()
+    with pytest.raises(HomeAssistantError):
+        await _call(tools(client)["update_recipe"], uid="R1")
+    client.update_recipe_partial.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_joins_ingredients_and_never_generates_images(client):
+    client.create_recipe = AsyncMock(return_value={"uid": "NEW", "name": "Test"})
+    result = await _call(tools(client)["create_recipe"], name="Test",
+                         ingredients=["1 cup flour", "2 eggs"], directions="Mix.", servings=4)
+    kwargs = client.create_recipe.await_args.kwargs
+    assert kwargs["generate_image"] is False
+    assert kwargs["ingredients"] == "1 cup flour\n2 eggs"
+    assert kwargs["servings"] == "4"
+    assert result.data == {"created": True, "uid": "NEW", "name": "Test"}
+
+
+@pytest.mark.asyncio
+async def test_read_recipe_splits_ingredients_and_reports_missing(client):
+    client.get_recipe_by_uid = AsyncMock(side_effect=[
+        {"uid": "R1", "name": "Rice", "ingredients": "1 cup rice\n\n2 cups water\n"},
+        None,
+    ])
+    t = tools(client)["read_recipe"]
+    got = (await _call(t, uid="R1")).data
+    assert got["found"] is True and got["ingredients"] == ["1 cup rice", "2 cups water"]
+    assert (await _call(t, uid="GONE")).data["found"] is False
+    with pytest.raises(HomeAssistantError):
+        await _call(t)

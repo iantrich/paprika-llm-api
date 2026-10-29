@@ -52,6 +52,8 @@ API_PROMPT = (
     "pantry with add_pantry_items so future lists skip it.\n"
     "Removals match exact names; read the list or pantry first and use the "
     "names as shown.\n"
+    "To edit a recipe, read it with read_recipe first, show the user exactly "
+    "what will change, and confirm before calling update_recipe.\n"
     "Grocery aisle names are the user's own (see get_grocery_aisles)."
 )
 
@@ -576,6 +578,163 @@ class SearchRecipesTool(PaprikaTool):
         }
 
 
+# Fields a recipe can be created with or edited. Ingredients are taken as a
+# list (one per line in Paprika) so the model never has to escape newlines.
+_RECIPE_TEXT_FIELDS = {
+    probatio.Optional("description", description="Short description."): str,
+    probatio.Optional("notes", description="Cooking notes."): str,
+    probatio.Optional(
+        "servings", description="Number of servings, as a whole number, e.g. '4'."
+    ): probatio.Coerce(str),
+    probatio.Optional("prep_time", description="Prep time, e.g. '15 mins'."): str,
+    probatio.Optional("cook_time", description="Cook time, e.g. '30 mins'."): str,
+    probatio.Optional("difficulty", description="Easy, Medium or Hard."): str,
+}
+
+
+def _recipe_payload(args: dict[str, Any]) -> dict[str, Any]:
+    """Map tool arguments onto client fields, joining ingredient lines."""
+    fields = {
+        key: args[key]
+        for key in (
+            "name", "directions", "description", "notes",
+            "servings", "prep_time", "cook_time", "difficulty",
+        )
+        if key in args
+    }
+    if "ingredients" in args:
+        fields["ingredients"] = "\n".join(
+            line.strip() for line in args["ingredients"] if line.strip()
+        )
+    return fields
+
+
+class ReadRecipeTool(PaprikaTool):
+    """Read one recipe in full."""
+
+    name = f"{TOOL_PREFIX}read_recipe"
+    title = "Read a Paprika recipe"
+    description = (
+        "Read a recipe's full content -- ingredients, directions, notes, times. "
+        "Use this before editing a recipe, so the edit starts from what is "
+        "actually there."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Optional("uid", description="Recipe uid from search_recipes (preferred)."): str,
+            probatio.Optional("title", description="Exact recipe title, if no uid."): str,
+        }
+    )
+    annotations = READ_ONLY
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Return the recipe, or report that it was not found."""
+        if args.get("uid"):
+            recipe = await self._client.get_recipe_by_uid(args["uid"])
+        elif args.get("title"):
+            recipe = await self._client.get_recipe_by_title(args["title"])
+        else:
+            raise ValidationError("Provide a recipe uid or title.")
+        if not recipe:
+            return {"found": False, "uid": args.get("uid"), "title": args.get("title")}
+        return {
+            "found": True,
+            "uid": recipe.get("uid"),
+            "name": recipe.get("name"),
+            "ingredients": [
+                line.strip()
+                for line in str(recipe.get("ingredients") or "").splitlines()
+                if line.strip()
+            ],
+            "directions": recipe.get("directions") or "",
+            "description": recipe.get("description") or "",
+            "notes": recipe.get("notes") or "",
+            "servings": recipe.get("servings") or "",
+            "prep_time": recipe.get("prep_time") or "",
+            "cook_time": recipe.get("cook_time") or "",
+            "total_time": recipe.get("total_time") or "",
+            "difficulty": recipe.get("difficulty") or "",
+            "source": recipe.get("source") or "",
+            "source_url": recipe.get("source_url") or "",
+            "rating": recipe.get("rating") or None,
+        }
+
+
+class CreateRecipeTool(PaprikaTool):
+    """Add a new recipe."""
+
+    name = f"{TOOL_PREFIX}create_recipe"
+    title = "Create a Paprika recipe"
+    description = (
+        "Add a new recipe to Paprika. A recipe with exactly the same name is "
+        "refused, so check with search_recipes first; to change an existing "
+        "recipe use update_recipe instead."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("name", description="Recipe name."): str,
+            probatio.Required(
+                "ingredients", description="Ingredient lines, e.g. ['2 cups flour', '3 eggs']."
+            ): [str],
+            probatio.Required(
+                "directions", description="Method, as text; separate steps with newlines."
+            ): str,
+            **_RECIPE_TEXT_FIELDS,
+        }
+    )
+    annotations = WRITE_ADDITIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Create the recipe and return its uid."""
+        fields = _recipe_payload(args)
+        # No image generation: the integration runs without a Replicate key,
+        # and a paid image call is not something to trigger implicitly.
+        recipe = await self._client.create_recipe(generate_image=False, **fields)
+        return {"created": True, "uid": recipe.get("uid"), "name": recipe.get("name")}
+
+
+class UpdateRecipeTool(PaprikaTool):
+    """Edit an existing recipe."""
+
+    name = f"{TOOL_PREFIX}update_recipe"
+    title = "Edit a Paprika recipe"
+    description = (
+        "Change an existing recipe. Send only the fields that change; "
+        "everything else -- including photo, categories, rating and source -- "
+        "is kept. Supplying ingredients replaces the whole ingredient list, so "
+        "read the recipe first and send the full edited list. Show the user the "
+        "change and confirm before calling this."
+    )
+    parameters = probatio.Schema(
+        {
+            probatio.Required("uid", description="Uid of the recipe to edit."): str,
+            probatio.Optional("name", description="New name."): str,
+            probatio.Optional(
+                "ingredients", description="The complete new ingredient list."
+            ): [str],
+            probatio.Optional("directions", description="The complete new method."): str,
+            **_RECIPE_TEXT_FIELDS,
+        }
+    )
+    annotations = WRITE_DESTRUCTIVE
+
+    async def _run(self, args: dict[str, Any]) -> JsonObjectType:
+        """Apply the edit and report which fields changed."""
+        fields = _recipe_payload(args)
+        if not fields:
+            raise ValidationError("Nothing to change: give at least one field.")
+        # update_recipe_partial fetches the stored recipe and changes only these
+        # fields. The client's update_recipe rebuilds the recipe from scratch
+        # and would drop photo, categories, rating and source -- never use it.
+        recipe = await self._client.update_recipe_partial(args["uid"], **fields)
+        return {
+            "updated": True,
+            "uid": recipe.get("uid", args["uid"]),
+            "name": recipe.get("name"),
+            "changed_fields": sorted(fields),
+        }
+
+
 # --------------------------------------------------------------- meal plan
 
 _WINDOW_FIELDS = {
@@ -787,6 +946,9 @@ def _build_tools(client: PaprikaClient) -> list[llm.Tool]:
             RemovePantryItemsTool,
             # recipes
             SearchRecipesTool,
+            ReadRecipeTool,
+            CreateRecipeTool,
+            UpdateRecipeTool,
             # meal plan
             ListMealPlanTool,
             GetMealPlanIngredientsTool,

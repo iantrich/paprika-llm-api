@@ -50,6 +50,9 @@ judgment rather than a string-matching parser. The tools do data access.
 | Tool | Behaviour |
 |---|---|
 | `paprika_llm__search_recipes` | read-only; lists everything when no query is given |
+| `paprika_llm__read_recipe` | read-only; full ingredients, method and notes |
+| `paprika_llm__create_recipe` | write; refuses a name that already exists |
+| `paprika_llm__update_recipe` | write, **destructive**; changes only the fields given |
 | `paprika_llm__list_meal_plan` | read-only |
 | `paprika_llm__get_meal_plan_ingredients` | read-only; ingredients for planned meals, plus in-stock pantry |
 | `paprika_llm__add_meal_to_plan` | write; refuses ambiguous recipe names rather than guessing |
@@ -68,6 +71,10 @@ judgment rather than a string-matching parser. The tools do data access.
 
 Meals planned as free-text notes (no recipe attached) are returned as kind
 `note` with no ingredients, not dropped.
+
+Recipe edits fetch the stored recipe and change only the fields supplied, so
+photo, categories, rating and source survive, and the date the recipe was
+added is left alone. Creating a recipe never triggers image generation.
 
 `delete_recipe` is deliberately omitted and will stay omitted.
 
