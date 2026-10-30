@@ -1,52 +1,36 @@
 # Paprika LLM API — Home Assistant
 
-Exposes your [Paprika Recipe Manager](https://www.paprikaapp.com/) recipes,
-grocery lists and meal plan to LLM clients as a Home Assistant **LLM API**.
+A Home Assistant custom integration that gives LLM clients, such as Claude,
+tools for your [Paprika Recipe Manager](https://www.paprikaapp.com/) account:
+recipes, meal plan, grocery lists and pantry.
 
-Home Assistant's
+It registers a Home Assistant **LLM API**. Home Assistant's
 [Model Context Protocol Server](https://www.home-assistant.io/integrations/mcp_server/)
-integration serves the tools over `/api/mcp`, so a cloud client such as Claude
-can reach them through Home Assistant Cloud (Nabu Casa) with no tunnel, no
-reverse proxy and no port forwarding.
+integration serves it to MCP clients, with sign-in handled by Home Assistant
+and remote access through Home Assistant Cloud (Nabu Casa) or your own setup.
 
-## Why this shape
+## What you can do
 
-This integration contains **no MCP server**. It registers an LLM API; Home
-Assistant is the MCP server. That means Home Assistant owns:
+- **Plan meals:** search your recipes, schedule them on the meal plan, and add
+  side dishes as notes.
+- **Build the grocery list:** gather the ingredients for every planned meal,
+  skip what's in your pantry, and add the rest in one go, sorted into your
+  aisles.
+- **Manage the pantry:** add items, mark them as run out, or remove them.
+- **Manage recipes:** read, create and edit recipes, or import one from a
+  recipe web page with its photo, source and link.
 
-| Concern | Who handles it |
-|---|---|
-| MCP transport | `mcp_server` integration |
-| OAuth 2.0 + PKCE, Client ID Metadata Documents | Home Assistant |
-| Remote access over HTTPS | Home Assistant Cloud, or your own method |
-| Credential storage | Home Assistant config entries |
-| Process lifecycle | Home Assistant |
+A typical weekly flow:
 
-The alternative — running a standalone MCP server — means building and
-operating all of the above yourself.
-
-## Status
-
-Built around one workflow: **plan the week's meals, then put everything
-they need on the grocery list, minus what's already in the pantry.**
-
-1. Pick recipes with `search_recipes` and schedule them with `add_meal_to_plan`;
-   add side dishes as notes with `add_note_to_plan`.
+1. Pick recipes with `search_recipes` and schedule them with
+   `add_meal_to_plan`; add sides with `add_note_to_plan`.
 2. `get_meal_plan_ingredients` returns every planned meal's ingredient lines
-   plus the in-stock pantry, in a handful of requests.
-3. The model merges ingredients across meals, applies each meal's scale, drops
-   what the pantry covers, and shows you the result — including what it
-   skipped — before writing anything.
-4. `add_groceries` writes the whole list in one request.
+   plus the in-stock pantry.
+3. The model merges the ingredients, applies each meal's scale, drops what the
+   pantry covers, and shows you the list before writing anything.
+4. `add_groceries` adds the whole list in one request.
 
-When you say you already have something, it can go into the pantry with
-`add_pantry_items` so later lists skip it. Removals — from the list or the
-pantry — match exact names only, and anything that doesn't match is reported
-back rather than guessed at.
-
-Ingredient lines are free text (`2 tablespoons soy sauce` against a pantry
-entry `soy sauce`), so merging and pantry matching are left to the model's
-judgment rather than a string-matching parser. The tools do data access.
+## Tools
 
 | Tool | Behaviour |
 |---|---|
@@ -55,10 +39,10 @@ judgment rather than a string-matching parser. The tools do data access.
 | `paprika_llm__create_recipe` | write; refuses a name that already exists |
 | `paprika_llm__import_recipe_from_url` | preview by default; `save=true` writes, with the page's photo, source and link; refuses a page already imported |
 | `paprika_llm__update_recipe` | write, **destructive**; changes only the fields given |
-| `paprika_llm__list_meal_plan` | read-only |
+| `paprika_llm__list_meal_plan` | read-only; recipes and notes, in their order for the day |
 | `paprika_llm__get_meal_plan_ingredients` | read-only; ingredients for planned meals, plus in-stock pantry |
-| `paprika_llm__add_meal_to_plan` | write; refuses ambiguous recipe names rather than guessing |
-| `paprika_llm__add_note_to_plan` | write; free-text entry such as a side dish, listed after the day's main dish |
+| `paprika_llm__add_meal_to_plan` | write; refuses ambiguous recipe names |
+| `paprika_llm__add_note_to_plan` | write; free-text entry such as a side dish, listed after the day's existing meals |
 | `paprika_llm__remove_meal_from_plan` | write, **destructive**; removes a meal or note; requires a date, recipe or note text |
 | `paprika_llm__get_grocery_lists` | read-only |
 | `paprika_llm__get_grocery_aisles` | read-only |
@@ -72,102 +56,68 @@ judgment rather than a string-matching parser. The tools do data access.
 | `paprika_llm__add_pantry_items` | write; adds or updates, can mark items as run out |
 | `paprika_llm__remove_pantry_items` | write, **destructive**; exact names, near-misses reported |
 
-Meals planned as free-text notes (no recipe attached) are returned as kind
-`note` with no ingredients, not dropped.
+Recipes cannot be deleted through these tools.
 
-Recipe edits fetch the stored recipe and change only the fields supplied, so
-photo, categories, rating and source survive, and the date the recipe was
-added is left alone. Creating a recipe never triggers image generation.
+## Details
 
-`delete_recipe` is deliberately omitted and will stay omitted.
+### Recipes
 
-### Request budget
-
-The Paprika API rate-limits. `add_groceries` reads the list, the aisles and
-the ingredient-aisle memory once each and posts every row together, so a
-40-item shopping list is four requests rather than well over a hundred.
-
-Paprika's sync index lists recipes by id and hash only, so knowing their names
-means fetching each recipe — one request apiece. The integration caches
-recipes against that hash and **saves the cache in Home Assistant's
-`.storage`**, so only the very first fill is expensive: after a restart a
-search costs one request plus whatever changed. A recipe edited elsewhere
-arrives with a new hash and is refetched, so the saved cache stays correct.
-Removing the integration deletes it.
-
-If Paprika starts refusing (HTTP 429) part-way through a fill, the fill stops
-at the first refusal instead of sending every remaining request into the same
-limit, keeps what it fetched, and reports how far it got. The next call picks
-up from there. Searches never present a partial library as complete, and
-creating a recipe stops before writing if its duplicate-name check could not
-finish.
-
-### Aisles
-
-`add_grocery` and `add_groceries` take an optional `aisle`, matched
-case-insensitively against the account's own aisle names (which may be numbers
-like `1`–`6` rather than categories — `get_grocery_aisles` lists them).
-`"aisle 5"` matches an aisle named `5`. An unknown aisle is an error that
-lists the real ones, and in a batch it fails the whole request before
-anything is written. Aisles are never created implicitly.
-
-Without an aisle:
-
-1. an item already on the list **keeps its current aisle**;
-2. a new item goes where Paprika remembers that ingredient belongs
-   (`/sync/groceryingredients/` — the same memory the Paprika apps sort by);
-3. otherwise it goes to `Miscellaneous`.
-
-### Importing from a link
+Editing a recipe changes only the fields supplied; photo, categories, rating,
+source and the date it was added are kept.
 
 `import_recipe_from_url` reads the schema.org `Recipe` data that most recipe
-sites embed for search engines, the same data Paprika's own browser import
-relies on. Pages without it are reported rather than guessed at. Times are
-converted to Paprika's style (`PT1H10M` → `1 hr 10 mins`), a yield like
-`1 loaf` is kept in the notes, and the page's photo is uploaded when it is a
-JPEG, PNG or WebP; a photo that cannot be fetched never blocks the import.
+sites publish. Times are converted to Paprika's style (`PT1H10M` →
+`1 hr 10 mins`), a yield such as `1 loaf` goes into the notes, and the page's
+photo is attached when it is a JPEG, PNG or WebP. Only public http(s)
+addresses are fetched, including after redirects. Some publishers (Allrecipes,
+Simply Recipes, Serious Eats) block automated requests; import those with the
+Paprika app's own browser.
 
-Fetching is limited to public http(s) addresses, checked again on every
-redirect, so a link can never make Home Assistant fetch something on the local
-network. Requests identify themselves honestly; some large publishers
-(Allrecipes, Simply Recipes, Serious Eats) refuse them, and those recipes are
-best imported with the Paprika app's own browser.
+### Grocery aisles
 
-## Not the same as `rbrunt/paprika-ha`
+`add_grocery` and `add_groceries` take an optional `aisle`, matched
+case-insensitively against your own aisle names (`get_grocery_aisles` lists
+them); `"aisle 5"` matches an aisle named `5`. An unknown aisle is an error
+that lists the real ones. Without an aisle:
 
-This integration uses the domain `paprika_llm`, deliberately. The unofficial
-[Paprika Recipes](https://github.com/rbrunt/paprika-ha) integration uses
-`paprika`, and two integrations cannot share a domain — HACS installs both into
-`custom_components/<domain>/`, so a collision silently overwrites one with the
-other and Home Assistant then hands one integration's config entry to the
-other's code.
+1. an item already on the list keeps its current aisle;
+2. a new item goes where Paprika remembers that ingredient belongs;
+3. otherwise it goes to `Miscellaneous`.
 
-The two do different things and can be installed side by side: that one
-exposes the meal plan as calendar entities; this one exposes tools to MCP
-clients.
+### Rate limits and caching
+
+Paprika rate-limits its API. Recipes are cached in Home Assistant's
+`.storage` and refreshed only when they change in Paprika, so after the first
+load a search costs about one request. If Paprika refuses requests part-way
+through a load, the integration keeps what it fetched, reports how far it got,
+and continues on the next call. Removing the integration deletes the cache.
+
+### Credentials
+
+Your Paprika credentials are stored in the Home Assistant config entry. They
+are never written to a file by this integration and never returned by any
+tool.
 
 ## Requirements
 
 - Home Assistant 2026.10 or newer
 - The [Model Context Protocol Server](https://www.home-assistant.io/integrations/mcp_server/)
-  integration, configured to expose this API
-- A way for the client to reach your instance (Home Assistant Cloud is the
-  least troublesome)
+  integration
+- A way for your client to reach Home Assistant, such as Home Assistant Cloud
 
 ## Installation
 
-1. Copy `custom_components/paprika_llm` into your Home Assistant `config/custom_components/`
-   directory, or add this repository to HACS as a custom integration.
+1. Add this repository to HACS as a custom integration and download it, or
+   copy `custom_components/paprika_llm` into `config/custom_components/`.
 2. Restart Home Assistant.
-3. **Settings → Devices & Services → Add Integration → Paprika LLM API**,
-   and sign in with your Paprika account.
-4. Open the **Model Context Protocol Server** integration's options and enable
-   the **Paprika** API under *Control Home Assistant* (or leave *Expose all LLM
-   APIs* on).
+3. **Settings → Devices & Services → Add Integration → Paprika LLM API**, and
+   sign in with your Paprika account.
+4. Connect your MCP client to `https://<your-home-assistant>/api/mcp/paprika_llm`
+   and sign in with a Home Assistant administrator account.
 
-Your Paprika credentials are held in Home Assistant's config entry store. They
-are never written to a file by this integration and are never returned by any
-tool, so they cannot reach a model's context.
+This integration's domain is `paprika_llm`, so it can be installed alongside
+[rbrunt/paprika-ha](https://github.com/rbrunt/paprika-ha), which shows the
+meal plan as calendar entities.
 
 ## Development
 
@@ -179,22 +129,11 @@ pytest -p no:anyio
 ```
 
 `tests/test_tools.py` renders every tool through Home Assistant's own
-`mcp_server` formatter, so a schema the client cannot use, or a parameter
+`mcp_server` formatter, so a schema an MCP client cannot use, or a parameter
 without a description, fails the suite.
 
 ## Attribution
 
-`custom_components/paprika_llm/paprika_client.py` is vendored from
+`custom_components/paprika_llm/paprika_client.py` is based on
 [paprika-mcp-python-server](https://github.com/sandordaroczi/paprika-mcp-python-server)
-by Sándor Daróczi (MIT), via
-[iantrich/paprika-mcp-python-server](https://github.com/iantrich/paprika-mcp-python-server),
-which carries additional fixes including:
-
-- ISO 8601 dates no longer parsed day-first (`2025-11-03` was read as 11 March)
-- `remove_meal_from_plan()` no longer prefers the wrong meal type
-- Ambiguous recipe titles raise instead of silently picking one
-- `clear_grocery_list` corrected (wrong endpoint, then a missing delete flag)
-- Recipe lookups cached on the sync index hash, turning a ~356-request library
-  walk into one request
-
-Both copyright notices are retained in `LICENSE`.
+by Sándor Daróczi (MIT). Both copyright notices are retained in `LICENSE`.
