@@ -1753,7 +1753,8 @@ class PaprikaClient:
 
         entry_date = meal_to_remove.get("date", "")
         entry_type = meal_to_remove.get("type", "")
-        entry_recipe_uid = meal_to_remove.get("meal_ID", "")
+        entry_recipe_uid = meal_to_remove.get("meal_ID") or ""
+        entry_name = meal_to_remove.get("meal") or ""
 
         try:
             response = await self._make_v1_basic_auth_request("GET", "/sync/meals/")
@@ -1779,13 +1780,27 @@ class PaprikaClient:
                     entry_type_check = entry_type_raw.lower()
                 else:
                     entry_type_check = "dinner"
+                # A note has no recipe: the raw row holds None where the
+                # listed entry holds "", so compare both as "".
                 entry_recipe_check = (
                     entry.get("recipe_uid") or entry.get("recipe_id") or entry.get("meal_id")
-                )
+                ) or ""
+                if not entry_recipe_uid:
+                    # Notes on the same day all share the empty recipe uid,
+                    # so tell them apart by their text.
+                    entry_name_check = (
+                        entry.get("name") or entry.get("recipe_name") or entry.get("meal") or ""
+                    )
+                    same_item = (
+                        entry_recipe_check == ""
+                        and entry_name_check.lower() == entry_name.lower()
+                    )
+                else:
+                    same_item = entry_recipe_check == entry_recipe_uid
                 if (
                     entry_date_check_clean == entry_date
                     and entry_type_check == entry_type.lower()
-                    and entry_recipe_check == entry_recipe_uid
+                    and same_item
                 ):
                     entry_to_delete = entry
                     break

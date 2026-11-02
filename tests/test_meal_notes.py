@@ -176,3 +176,41 @@ async def test_unknown_meal_type_is_refused_without_writing(client):
     with pytest.raises(Exception, match="No Paprika meal type named 'snack'.*Dinner"):
         await client.add_note_to_plan("Chips", DAY, meal_type="snack")
     assert client.posted == []
+
+
+# The remove path GETs every row, so give it a day with a recipe and two notes.
+REMOVE_DAY = "2026-11-07"
+REMOVE_ROWS = [
+    {"uid": "N1", "recipe_uid": None, "date": f"{REMOVE_DAY} 00:00:00", "type": 2,
+     "name": "Jasmine Rice", "order_flag": 1},
+    {"uid": "N2", "recipe_uid": None, "date": f"{REMOVE_DAY} 00:00:00", "type": 2,
+     "name": "Pizza (take out)", "order_flag": 2},
+    {"uid": "R1", "recipe_uid": "BEEF", "date": f"{REMOVE_DAY} 00:00:00", "type": 2,
+     "name": "Beef and Broccoli", "order_flag": 0},
+]
+
+
+@pytest.fixture
+def remove_client(client):
+    async def v1(method, path, **kwargs):
+        if method == "GET":
+            return {"result": REMOVE_ROWS}
+        client.posted.append(path)
+        return {"result": True}
+
+    client._make_v1_basic_auth_request = v1
+    return client
+
+
+@pytest.mark.asyncio
+async def test_note_can_be_removed(remove_client):
+    out = await remove_client.remove_meal_from_plan(meal="Pizza (take out)", date=REMOVE_DAY)
+    assert remove_client.sent == [{"uid": "N2", "deleted": True}], "the named note, not the other one"
+    assert remove_client.posted == ["/sync/meals/"]
+    assert out["meal"] == "Pizza (take out)"
+
+
+@pytest.mark.asyncio
+async def test_recipe_removal_still_matches_by_recipe(remove_client):
+    await remove_client.remove_meal_from_plan(meal_id="BEEF", date=REMOVE_DAY)
+    assert remove_client.sent == [{"uid": "R1", "deleted": True}]
