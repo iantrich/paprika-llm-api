@@ -24,12 +24,30 @@ RAW = [
      "name": "Leftovers", "order_flag": 4, "scale": None},
 ]
 
+# /sync/mealtypes rows, with the uids the app assigns to the default types.
+MEAL_TYPES = [
+    {"uid": "MT-B", "name": "Breakfast", "order_flag": 0, "original_type": 0},
+    {"uid": "MT-L", "name": "Lunch", "order_flag": 1, "original_type": 1},
+    {"uid": "MT-D", "name": "Dinner", "order_flag": 2, "original_type": 2},
+    {"uid": "MT-X", "name": "Snack", "order_flag": 3, "deleted": True},
+]
+
 
 @pytest.fixture
 def client():
     c = PaprikaClient("t@example.com", "pw")
     c.token = "tok"
     c.posted = []
+    c.v2_gets = []
+    c.recipe = {"name": "Garlic Bread"}
+
+    async def v2(method, path, **kwargs):
+        c.v2_gets.append(path)
+        if path == "/sync/mealtypes/":
+            return {"result": MEAL_TYPES}
+        return {"result": c.recipe}
+
+    c._make_authenticated_request = v2
 
     async def v1(method, path, **kwargs):
         if method == "GET":
@@ -56,6 +74,7 @@ async def test_note_is_an_entry_without_a_recipe_after_existing_sides(client):
     assert entry["name"] == "Steamed Broccoli"
     assert entry["date"] == f"{DAY} 00:00:00"
     assert entry["type"] == 2
+    assert entry["type_uid"] == "MT-D"
     assert entry["order_flag"] == 2, "goes after the main (0) and the rice (1)"
     assert entry["deleted"] is False
     assert client.posted == ["/sync/meals/"]
@@ -67,6 +86,7 @@ async def test_order_counts_only_the_same_meal_type(client):
     await client.add_note_to_plan("Fruit", "2026-11-02", meal_type="breakfast")
     assert client.sent[0]["order_flag"] == 0, "nothing planned for breakfast"
     assert client.sent[0]["type"] == 1
+    assert client.sent[0]["type_uid"] == "MT-B"
 
 
 @pytest.mark.asyncio
@@ -77,12 +97,10 @@ async def test_note_on_an_empty_day_is_first(client):
 
 @pytest.mark.asyncio
 async def test_recipe_added_to_a_busy_day_is_appended_too(client):
-    client._make_authenticated_request = AsyncMock(
-        return_value={"result": {"name": "Garlic Bread"}}
-    )
     await client.add_meal_to_plan(meal_id="R9", date=DAY)
     [entry] = client.sent
     assert entry["recipe_uid"] == "R9"
+    assert entry["type_uid"] == "MT-D"
     assert entry["name"] == "Garlic Bread"
     assert entry["order_flag"] == 2
 
@@ -132,3 +150,29 @@ async def test_tool_reports_rate_limit_from_the_day_lookup():
         "Failed to get meal plan: Request failed with status 429"))
     with pytest.raises(HomeAssistantError, match="rate-limiting"):
         await _call(tools(client)["add_note_to_plan"], note="Corn", date=DAY)
+
+
+@pytest.mark.asyncio
+async def test_meal_types_are_fetched_once(client):
+    await client.add_note_to_plan("Corn", DAY)
+    await client.add_note_to_plan("Soup", DAY, meal_type="Lunch")
+    assert client.sent[0]["type_uid"] == "MT-L"
+    assert client.v2_gets.count("/sync/mealtypes/") == 1
+
+
+@pytest.mark.asyncio
+async def test_meal_type_added_since_the_cache_was_filled_is_found(client):
+    await client.add_note_to_plan("Corn", DAY)
+    MEAL_TYPES.append({"uid": "MT-S", "name": "Supper"})
+    try:
+        await client.add_note_to_plan("Toast", DAY, meal_type="supper")
+    finally:
+        MEAL_TYPES.pop()
+    assert client.sent[0]["type_uid"] == "MT-S"
+
+
+@pytest.mark.asyncio
+async def test_unknown_meal_type_is_refused_without_writing(client):
+    with pytest.raises(Exception, match="No Paprika meal type named 'snack'.*Dinner"):
+        await client.add_note_to_plan("Chips", DAY, meal_type="snack")
+    assert client.posted == []

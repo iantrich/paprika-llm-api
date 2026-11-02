@@ -100,6 +100,10 @@ class PaprikaClient:
         # it. Without persistence every restart re-walks the whole library,
         # which is what runs into Paprika's rate limit.
         self.on_recipe_cache_changed: Optional[Any] = None
+        # /sync/mealtypes rows. A meal plan entry links to its meal type by
+        # type_uid; the numeric `type` is a legacy field that newer readers
+        # (the app's calendar export, paprika-ha) ignore.
+        self._meal_types: Optional[List[Dict[str, Any]]] = None
         self.token: Optional[str] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.image_generator = image_generator
@@ -1610,6 +1614,35 @@ class PaprikaClient:
         await self._post_meal_entry(note, None, parsed_date, meal_type)
         return {"meal": note, "meal_ID": None, "date": parsed_date, "type": meal_type}
 
+    async def _get_meal_types(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """Return the account's meal types, fetched once and then cached."""
+        if self._meal_types is None or refresh:
+            response = await self._make_authenticated_request("GET", "/sync/mealtypes/")
+            rows = response.get("result") or []
+            self._meal_types = [
+                r for r in rows
+                if isinstance(r, dict) and r.get("uid") and not r.get("deleted")
+            ]
+        return self._meal_types
+
+    async def _resolve_meal_type_uid(self, meal_type: str) -> str:
+        """Map a meal type name (breakfast, lunch, dinner, ...) to its uid.
+
+        Meal types are user-editable, so match on the name as the account has
+        it. On a miss, refetch once in case the cache predates a change.
+        """
+        wanted = (meal_type or "").strip().lower()
+        types: List[Dict[str, Any]] = []
+        for refresh in (False, True):
+            types = await self._get_meal_types(refresh=refresh)
+            for mt in types:
+                if (mt.get("name") or "").strip().lower() == wanted:
+                    return mt["uid"]
+        names = ", ".join(sorted(mt.get("name", "") for mt in types)) or "none"
+        raise ValidationError(
+            f"No Paprika meal type named '{meal_type}'. Available: {names}"
+        )
+
     async def _post_meal_entry(
         self,
         name: str,
@@ -1626,6 +1659,9 @@ class PaprikaClient:
             start_date=parsed_date, end_date=parsed_date, meal_type=meal_type
         )
         order = max((m.get("order", 0) for m in day), default=-1) + 1
+        # Without type_uid the entry is invisible to anything that reads meal
+        # types the current way, e.g. the paprika-ha calendar.
+        type_uid = await self._resolve_meal_type_uid(meal_type)
 
         meal_type_map = {"breakfast": 1, "dinner": 2, "lunch": 3}
         meal_entry = {
@@ -1634,6 +1670,7 @@ class PaprikaClient:
             "name": name,
             "date": f"{parsed_date} 00:00:00",
             "type": meal_type_map.get(meal_type.lower(), 2),
+            "type_uid": type_uid,
             "order_flag": order,
             "deleted": False,
         }
